@@ -145,7 +145,20 @@ def _valid_runtime():
     # DSv4 dspark draft attention reads the target SWA caches, so the runtime
     # marks the SWA group as the eagle group. SWA tensors must still gate.
     config.kv_cache_groups[2].is_eagle_group = True
-    return config, kv_caches
+    # Compressor state caches ride in the MLA groups and must be excluded.
+    for group, layer_ids in (
+        (config.kv_cache_groups[0], sorted(NATIVE432_C4_LAYER_IDS)),
+        (config.kv_cache_groups[1], sorted(NATIVE432_C128_LAYER_IDS)),
+    ):
+        for layer_id in layer_ids:
+            name = f"model.layers.{layer_id}.attn.compressor.state_cache"
+            group.layer_names.append(name)
+            kv_caches[name] = _FakeTensor(
+                (11074, 4, 2048), (4 * 2048, 2048, 1), offset=0, dtype="torch.uint8"
+            )
+            config.kv_cache_tensors.append(
+                _CfgTensor(size=kv_caches[name].numel(), shared_by=[name])
+            )
 
 
 def test_valid_mapped_inventory_passes():
@@ -251,6 +264,14 @@ def test_shared_alias_view_is_not_overlap():
     config.kv_cache_groups.append(_Group(layer_names=[alias]))
     with pytest.raises(Native432RegistrationError):
         # Alias layer id 0 is not a C4 owner, so the name itself must fail.
+        validate_native432_runtime_registration(config, kv_caches)
+
+
+def test_native_shaped_compressor_tensor_fails():
+    config, kv_caches = _valid_runtime()
+    name = "model.layers.2.attn.compressor.state_cache"
+    kv_caches[name] = _native_tensor("c4", offset=0, storage_key=777)
+    with pytest.raises(Native432RegistrationError):
         validate_native432_runtime_registration(config, kv_caches)
 
 

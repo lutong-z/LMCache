@@ -41,7 +41,8 @@ NATIVE432_ROLE_GEOMETRY = {
     "swa": (1, 64, 64),
 }
 
-_LAYER_ID_RE = re.compile(r"layers\.(\d+)\.")
+_MLA_NAME_RE = re.compile(r"layers\.(\d+)\.attn$")
+_SWA_NAME_RE = re.compile(r"layers\.(\d+)\.attn\.swa_cache$")
 
 
 class Native432RegistrationError(ValueError):
@@ -53,29 +54,30 @@ def _fail(reason: str) -> None:
 
 
 def _layer_id(name: str) -> int | None:
-    match = _LAYER_ID_RE.search(name)
+    match = _MLA_NAME_RE.search(name) or _SWA_NAME_RE.search(name)
     return int(match.group(1)) if match else None
-
-
-def _is_excluded_name(name: str) -> bool:
-    """Indexer, draft, and MTP caches are never native432 MLA pages."""
-    lowered = name.lower()
-    return ".indexer." in lowered or "draft" in lowered or "mtp" in lowered
 
 
 def _role_for_name(name: str) -> str | None:
     """Map one tensor name to its native432 role, or None when unmappable."""
-    if name.endswith(".swa_cache"):
-        layer_id = _layer_id(name)
-        if layer_id in NATIVE432_SWA_LAYER_IDS:
+    swa_match = _SWA_NAME_RE.search(name)
+    if swa_match is not None:
+        if int(swa_match.group(1)) in NATIVE432_SWA_LAYER_IDS:
             return "swa"
         return None
-    layer_id = _layer_id(name)
-    if layer_id in NATIVE432_C4_LAYER_IDS:
-        return "c4"
-    if layer_id in NATIVE432_C128_LAYER_IDS:
-        return "c128"
+    mla_match = _MLA_NAME_RE.search(name)
+    if mla_match is not None:
+        layer_id = int(mla_match.group(1))
+        if layer_id in NATIVE432_C4_LAYER_IDS:
+            return "c4"
+        if layer_id in NATIVE432_C128_LAYER_IDS:
+            return "c128"
     return None
+
+
+def _is_excluded_name(name: str) -> bool:
+    """Only exact MLA and SWA cache names are native432 candidates."""
+    return _MLA_NAME_RE.search(name) is None and _SWA_NAME_RE.search(name) is None
 
 
 def _tensor_shape(tensor: Any) -> tuple[int, ...]:
