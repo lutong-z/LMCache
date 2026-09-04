@@ -81,8 +81,16 @@ class _Config:
     kv_cache_groups: list[_Group] = field(default_factory=list)
 
 
-def _layer_name(layer_id: int) -> str:
-    return f"language_model.model.layers.{layer_id}.self_attn.attn"
+def _mla_name(layer_id: int) -> str:
+    return f"model.layers.{layer_id}.attn"
+
+
+def _swa_name(layer_id: int) -> str:
+    return f"model.layers.{layer_id}.attn.swa_cache"
+
+
+def _indexer_name(layer_id: int) -> str:
+    return f"model.layers.{layer_id}.attn.indexer.k_cache"
 
 
 def _native_tensor(role: str, *, offset: int, storage_key: int, blocks: int = 4):
@@ -101,13 +109,9 @@ def _valid_runtime():
     config = _Config()
     kv_caches: dict[str, _FakeTensor] = {}
     for role, layer_ids, name_fn in (
-        ("c4", sorted(NATIVE432_C4_LAYER_IDS), _layer_name),
-        ("c128", sorted(NATIVE432_C128_LAYER_IDS), _layer_name),
-        (
-            "swa",
-            sorted(NATIVE432_SWA_LAYER_IDS),
-            lambda layer_id: f"{_layer_name(layer_id)}.swa_cache",
-        ),
+        ("c4", sorted(NATIVE432_C4_LAYER_IDS), _mla_name),
+        ("c128", sorted(NATIVE432_C128_LAYER_IDS), _mla_name),
+        ("swa", sorted(NATIVE432_SWA_LAYER_IDS), _swa_name),
     ):
         _, _, slots = NATIVE432_ROLE_GEOMETRY[role]
         page_bytes = slots * NATIVE432_RECORD_BYTES
@@ -125,6 +129,18 @@ def _valid_runtime():
                 )
             )
         config.kv_cache_groups.append(_Group(layer_names=names))
+    # Excluded-role indexer caches share a group with SWA layers.
+    indexer_names = []
+    for layer_id in sorted(NATIVE432_SWA_LAYER_IDS):
+        name = _indexer_name(layer_id)
+        indexer_names.append(name)
+        kv_caches[name] = _FakeTensor(
+            (11084, 64, 132), (64 * 132, 132, 1), offset=0, dtype="torch.uint8"
+        )
+        config.kv_cache_tensors.append(
+            _CfgTensor(size=kv_caches[name].numel(), shared_by=[name])
+        )
+    config.kv_cache_groups[2].layer_names.extend(indexer_names)
     return config, kv_caches
 
 
@@ -141,7 +157,7 @@ def test_missing_config_fails():
 
 def test_missing_layer_tensor_fails():
     config, kv_caches = _valid_runtime()
-    del kv_caches[f"{_layer_name(sorted(NATIVE432_SWA_LAYER_IDS)[0])}.swa_cache"]
+    del kv_caches[_swa_name(sorted(NATIVE432_SWA_LAYER_IDS)[0])]
     with pytest.raises(Native432RegistrationError):
         validate_native432_runtime_registration(config, kv_caches)
 
@@ -149,9 +165,12 @@ def test_missing_layer_tensor_fails():
 def test_missing_layer_group_fails():
     config, kv_caches = _valid_runtime()
     swa_group = next(
-        group for group in config.kv_cache_groups if len(group.layer_names) == 43
+        group
+        for group in config.kv_cache_groups
+        if _swa_name(0) in group.layer_names
     )
-    dropped = swa_group.layer_names.pop()
+    dropped = _swa_name(0)
+    swa_group.layer_names.remove(dropped)
     with pytest.raises(Native432RegistrationError):
         validate_native432_runtime_registration(config, kv_caches)
     swa_group.layer_names.append(dropped)
@@ -159,10 +178,13 @@ def test_missing_layer_group_fails():
 
 def test_wrong_dtype_fails():
     config, kv_caches = _valid_runtime()
-    name = _layer_name(sorted(NATIVE432_C4_LAYER_IDS)[0])
+    name = _mla_name(sorted(NATIVE432_C4_LAYER_IDS)[0])
     original = kv_caches[name]
     kv_caches[name] = _FakeTensor(
-        original.shape, original.stride(), offset=original.storage_offset(), dtype="torch.float8_e4m3fn"
+        original.shape,
+        original.stride(),
+        offset=original.storage_offset(),
+        dtype="torch.float8_e4m3fn",
     )
     with pytest.raises(Native432RegistrationError):
         validate_native432_runtime_registration(config, kv_caches)
@@ -170,7 +192,7 @@ def test_wrong_dtype_fails():
 
 def test_wrong_slot_count_fails():
     config, kv_caches = _valid_runtime()
-    name = _layer_name(sorted(NATIVE432_C128_LAYER_IDS)[0])
+    name = _mla_name(sorted(NATIVE432_C128_LAYER_IDS)[0])
     kv_caches[name] = _FakeTensor(
         (4, 64, NATIVE432_RECORD_BYTES),
         (64 * NATIVE432_RECORD_BYTES, NATIVE432_RECORD_BYTES, 1),
@@ -182,7 +204,7 @@ def test_wrong_slot_count_fails():
 
 def test_inner_stride_mismatch_fails():
     config, kv_caches = _valid_runtime()
-    name = _layer_name(sorted(NATIVE432_C4_LAYER_IDS)[0])
+    name = _mla_name(sorted(NATIVE432_C4_LAYER_IDS)[0])
     kv_caches[name] = _FakeTensor(
         (4, 64, NATIVE432_RECORD_BYTES),
         (64 * NATIVE432_RECORD_BYTES, NATIVE432_RECORD_BYTES + 16, 1),
@@ -194,7 +216,7 @@ def test_inner_stride_mismatch_fails():
 
 def test_offset_disagreement_fails():
     config, kv_caches = _valid_runtime()
-    name = _layer_name(sorted(NATIVE432_C4_LAYER_IDS)[0])
+    name = _mla_name(sorted(NATIVE432_C4_LAYER_IDS)[0])
     cfg = next(cfg for cfg in config.kv_cache_tensors if cfg.shared_by == [name])
     cfg.offset += NATIVE432_RECORD_BYTES
     with pytest.raises(Native432RegistrationError):
@@ -203,9 +225,7 @@ def test_offset_disagreement_fails():
 
 def test_packed_overlap_fails():
     config, kv_caches = _valid_runtime()
-    names = sorted(
-        (name for name in kv_caches if _layer_name(2) == name or _layer_name(4) == name)
-    )
+    names = [_mla_name(2), _mla_name(4)]
     victim = kv_caches[names[1]]
     kv_caches[names[1]] = _FakeTensor(
         victim.shape,
@@ -217,9 +237,22 @@ def test_packed_overlap_fails():
         validate_native432_runtime_registration(config, kv_caches)
 
 
+def test_shared_alias_view_is_not_overlap():
+    config, kv_caches = _valid_runtime()
+    owner = _mla_name(2)
+    alias = "model.layers.0.attn.alias_view"
+    owner_cfg = next(cfg for cfg in config.kv_cache_tensors if cfg.shared_by == [owner])
+    owner_cfg.shared_by.append(alias)
+    kv_caches[alias] = kv_caches[owner]
+    config.kv_cache_groups.append(_Group(layer_names=[alias]))
+    with pytest.raises(Native432RegistrationError):
+        # Alias layer id 0 is not a C4 owner, so the name itself must fail.
+        validate_native432_runtime_registration(config, kv_caches)
+
+
 def test_unmapped_native_shaped_tensor_fails():
     config, kv_caches = _valid_runtime()
-    draft_name = "language_model.draft_model.layers.0.self_attn.attn"
+    draft_name = "model.draft_model.layers.0.attn"
     kv_caches[draft_name] = _native_tensor("c4", offset=0, storage_key=424242)
     config.kv_cache_tensors.append(
         _CfgTensor(
@@ -234,9 +267,17 @@ def test_unmapped_native_shaped_tensor_fails():
         validate_native432_runtime_registration(config, kv_caches)
 
 
+def test_native_shaped_indexer_tensor_fails():
+    config, kv_caches = _valid_runtime()
+    name = _indexer_name(2)
+    kv_caches[name] = _native_tensor("c4", offset=0, storage_key=31337)
+    with pytest.raises(Native432RegistrationError):
+        validate_native432_runtime_registration(config, kv_caches)
+
+
 def test_non_native_draft_group_is_ignored():
     config, kv_caches = _valid_runtime()
-    draft_name = "language_model.draft_model.layers.0.self_attn.attn"
+    draft_name = "model.draft_model.layers.0.attn"
     kv_caches[draft_name] = _FakeTensor(
         (4, 64, 656), (64 * 656, 656, 1), offset=0, dtype="torch.uint8"
     )

@@ -10,10 +10,14 @@ together prove the pinned runtime mapping:
 
 - C4 layers 2..42 (even), 4:1 compression, 64 storage slots per 256-token page
 - C128 layers 3..41 (odd), 128:1 compression, 2 storage slots per 256-token page
-- SWA layers 0..42, uncompressed, 64 slots per 64-token window page
+- SWA layers 0..42 (``.swa_cache`` views), 64 slots per 64-token window page
 
-Anything missing, duplicated, ambiguous, stale, or overlapping raises
-``Native432RegistrationError`` before the LMCache server handshake.
+Classification is per tensor name, never per group: the runtime mixes MLA,
+SWA, indexer, and draft caches inside kv cache groups. Indexer, draft, and
+MTP caches are excluded roles; they are ignored unless their tensors look
+like unmapped native432 records. Anything missing, duplicated, ambiguous,
+stale, or overlapping raises ``Native432RegistrationError`` before the
+LMCache server handshake.
 """
 
 # Standard
@@ -53,13 +57,24 @@ def _layer_id(name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _role_for_layer_ids(ids: frozenset[int]) -> str | None:
-    if ids and ids <= NATIVE432_C4_LAYER_IDS:
+def _is_excluded_name(name: str) -> bool:
+    """Indexer, draft, and MTP caches are never native432 MLA pages."""
+    lowered = name.lower()
+    return ".indexer." in lowered or "draft" in lowered or "mtp" in lowered
+
+
+def _role_for_name(name: str) -> str | None:
+    """Map one tensor name to its native432 role, or None when unmappable."""
+    if name.endswith(".swa_cache"):
+        layer_id = _layer_id(name)
+        if layer_id in NATIVE432_SWA_LAYER_IDS:
+            return "swa"
+        return None
+    layer_id = _layer_id(name)
+    if layer_id in NATIVE432_C4_LAYER_IDS:
         return "c4"
-    if ids and ids <= NATIVE432_C128_LAYER_IDS:
+    if layer_id in NATIVE432_C128_LAYER_IDS:
         return "c128"
-    if ids and ids <= NATIVE432_SWA_LAYER_IDS:
-        return "swa"
     return None
 
 
@@ -103,8 +118,7 @@ def _tensor_is_uint8(tensor: Any) -> bool:
     dtype = getattr(tensor, "dtype", None)
     if dtype is None:
         return False
-    text = str(dtype).lower()
-    return "uint8" in text
+    return "uint8" in str(dtype).lower()
 
 
 def _looks_native432(tensor: Any) -> bool:
@@ -118,21 +132,6 @@ def _looks_native432(tensor: Any) -> bool:
         and shape[-1] == NATIVE432_RECORD_BYTES
         and _tensor_is_uint8(tensor)
     )
-
-
-def _group_layer_ids(group: Any) -> frozenset[int]:
-    layer_names = getattr(group, "layer_names", None)
-    if not layer_names:
-        _fail("kv cache group has no layer_names")
-    ids: set[int] = set()
-    for name in layer_names:
-        if not isinstance(name, str):
-            _fail(f"kv cache group layer name is not a string: {name!r}")
-        layer_id = _layer_id(name)
-        if layer_id is None:
-            _fail(f"cannot parse layer id from {name!r}")
-        ids.add(layer_id)
-    return frozenset(ids)
 
 
 def _tensor_config_by_alias(kv_cache_config: Any) -> dict[str, Any]:
@@ -204,8 +203,6 @@ def _validate_native_tensor(
     return _tensor_storage_key(tensor), offset, offset + page_bytes
 
 
-
-
 def validate_native432_runtime_registration(
     kv_cache_config: Any,
     kv_caches: dict[str, Any],
@@ -213,7 +210,7 @@ def validate_native432_runtime_registration(
     """Prove the registered caches satisfy the pinned native432 mapping.
 
     Fail closed on any missing, duplicated, ambiguous, or overlapping
-    native432 view. Draft/MTP/indexer/state groups are ignored unless their
+    native432 view. Indexer, draft, and MTP caches are ignored unless their
     tensors look like unmapped native432 records.
     """
     if kv_cache_config is None:
@@ -227,40 +224,37 @@ def validate_native432_runtime_registration(
 
     tensor_cfgs = _tensor_config_by_alias(kv_cache_config)
     seen_aliases: set[str] = set()
+    validated_cfgs: set[int] = set()
     role_layers: dict[str, set[int]] = {"c4": set(), "c128": set(), "swa": set()}
     # (storage key, dim0 stride) -> sorted list of [offset, end) intervals
     packed_intervals: dict[tuple[Any, int], list[tuple[int, int]]] = {}
 
     for group in groups:
-        layer_names = list(getattr(group, "layer_names", ()) or ())
-        is_draft_group = bool(getattr(group, "is_eagle_group", False)) or any(
-            "draft" in name.lower() or "mtp" in name.lower() for name in layer_names
-        )
-        if is_draft_group:
-            # Draft/MTP KV is never a native432 MLA page. Reject native-shaped
-            # tensors here so draft/indexer/state caches cannot impersonate
-            # the pinned mapping.
-            for name in layer_names:
+        is_eagle_group = bool(getattr(group, "is_eagle_group", False))
+        for name in list(getattr(group, "layer_names", ()) or ()):
+            if not isinstance(name, str):
+                _fail(f"kv cache group layer name is not a string: {name!r}")
+            if is_eagle_group or _is_excluded_name(name):
                 tensor = kv_caches.get(name)
                 if tensor is not None and _looks_native432(tensor):
                     _fail(
-                        f"draft/indexer/state tensor {name!r} matches "
-                        f"native432 geometry"
+                        f"excluded-role tensor {name!r} matches native432 "
+                        f"geometry"
                     )
-            continue
-        ids = _group_layer_ids(group)
-        role = _role_for_layer_ids(ids)
-        if role is None:
-            for name in layer_names:
-                tensor = kv_caches.get(name)
-                if tensor is not None and _looks_native432(tensor):
-                    _fail(
-                        f"tensor {name!r} matches native432 geometry but its "
-                        f"layers {sorted(ids)!r} are outside the pinned mapping"
-                    )
-            continue
+                continue
 
-        for name in layer_names:
+            role = _role_for_name(name)
+            if role is None:
+                tensor = kv_caches.get(name)
+                if tensor is not None and _looks_native432(tensor):
+                    _fail(
+                        f"tensor {name!r} matches native432 geometry but is "
+                        f"outside the pinned mapping"
+                    )
+                continue
+            layer_id = _layer_id(name)
+            assert layer_id is not None  # guaranteed by _role_for_name
+
             if name in seen_aliases:
                 _fail(f"layer {name!r} appears in more than one group")
             seen_aliases.add(name)
@@ -270,6 +264,14 @@ def validate_native432_runtime_registration(
             tensor_cfg = tensor_cfgs.get(name)
             if tensor_cfg is None:
                 _fail(f"{role} layer {name!r} has no kv_cache_tensor entry")
+            role_layers[role].add(layer_id)
+
+            # Aliases of one kv_cache_tensor share the same view; validate
+            # the underlying view once so sharing is not read as overlap.
+            cfg_key = id(tensor_cfg)
+            if cfg_key in validated_cfgs:
+                continue
+            validated_cfgs.add(cfg_key)
             storage_key, offset, end = _validate_native_tensor(
                 name, tensor, tensor_cfg, role=role
             )
@@ -277,7 +279,6 @@ def validate_native432_runtime_registration(
             packed_intervals.setdefault((storage_key, strides[0]), []).append(
                 (offset, end)
             )
-        role_layers[role] |= set(ids)
 
     for role, expected in (
         ("c4", NATIVE432_C4_LAYER_IDS),
