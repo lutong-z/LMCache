@@ -204,6 +204,8 @@ def _validate_native_tensor(
     return _tensor_storage_key(tensor), offset, offset + page_bytes
 
 
+
+
 def validate_native432_runtime_registration(
     kv_cache_config: Any,
     kv_caches: dict[str, Any],
@@ -211,8 +213,8 @@ def validate_native432_runtime_registration(
     """Prove the registered caches satisfy the pinned native432 mapping.
 
     Fail closed on any missing, duplicated, ambiguous, or overlapping
-    native432 view. Groups that are not native MLA (draft/indexer/state)
-    are ignored unless their tensors look like unmapped native432 records.
+    native432 view. Draft/MTP/indexer/state groups are ignored unless their
+    tensors look like unmapped native432 records.
     """
     if kv_cache_config is None:
         _fail("kv_cache_config is unavailable")
@@ -230,10 +232,26 @@ def validate_native432_runtime_registration(
     packed_intervals: dict[tuple[Any, int], list[tuple[int, int]]] = {}
 
     for group in groups:
+        layer_names = list(getattr(group, "layer_names", ()) or ())
+        is_draft_group = bool(getattr(group, "is_eagle_group", False)) or any(
+            "draft" in name.lower() or "mtp" in name.lower() for name in layer_names
+        )
+        if is_draft_group:
+            # Draft/MTP KV is never a native432 MLA page. Reject native-shaped
+            # tensors here so draft/indexer/state caches cannot impersonate
+            # the pinned mapping.
+            for name in layer_names:
+                tensor = kv_caches.get(name)
+                if tensor is not None and _looks_native432(tensor):
+                    _fail(
+                        f"draft/indexer/state tensor {name!r} matches "
+                        f"native432 geometry"
+                    )
+            continue
         ids = _group_layer_ids(group)
         role = _role_for_layer_ids(ids)
         if role is None:
-            for name in group.layer_names:
+            for name in layer_names:
                 tensor = kv_caches.get(name)
                 if tensor is not None and _looks_native432(tensor):
                     _fail(
@@ -242,7 +260,7 @@ def validate_native432_runtime_registration(
                     )
             continue
 
-        for name in group.layer_names:
+        for name in layer_names:
             if name in seen_aliases:
                 _fail(f"layer {name!r} appears in more than one group")
             seen_aliases.add(name)
