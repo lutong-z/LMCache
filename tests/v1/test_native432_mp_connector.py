@@ -142,6 +142,9 @@ def _valid_runtime():
             _CfgTensor(size=kv_caches[name].numel(), shared_by=[name])
         )
     config.kv_cache_groups[2].layer_names.extend(indexer_names)
+    # DSv4 dspark draft attention reads the target SWA caches, so the runtime
+    # marks the SWA group as the eagle group. SWA tensors must still gate.
+    config.kv_cache_groups[2].is_eagle_group = True
     return config, kv_caches
 
 

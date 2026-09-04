@@ -240,11 +240,14 @@ def validate_native432_runtime_registration(
     packed_intervals: dict[tuple[Any, int], list[tuple[int, int]]] = {}
 
     for group in groups:
-        is_eagle_group = bool(getattr(group, "is_eagle_group", False))
         for name in list(getattr(group, "layer_names", ()) or ()):
             if not isinstance(name, str):
                 _fail(f"kv cache group layer name is not a string: {name!r}")
-            if is_eagle_group or _is_excluded_name(name):
+            # NOTE: is_eagle_group is intentionally NOT an exclusion signal.
+            # DSv4 dspark draft attention reads the target SWA caches, so the
+            # runtime marks the whole SWA group as the eagle group; excluding
+            # by that flag would exempt every SWA tensor from validation.
+            if _is_excluded_name(name):
                 tensor = kv_caches.get(name)
                 if tensor is not None and _looks_native432(tensor):
                     _fail(
