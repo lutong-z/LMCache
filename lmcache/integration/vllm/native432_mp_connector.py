@@ -238,8 +238,8 @@ def validate_native432_runtime_registration(
     seen_aliases: set[str] = set()
     validated_cfgs: set[int] = set()
     role_layers: dict[str, set[int]] = {"c4": set(), "c128": set(), "swa": set()}
-    # (storage key, dim0 stride) -> sorted list of [offset, end) intervals
-    packed_intervals: dict[tuple[Any, int], list[tuple[int, int]]] = {}
+    # (storage key, dim0 stride) -> sorted list of (offset, end, name) views
+    packed_intervals: dict[tuple[Any, int], list[tuple[int, int, str]]] = {}
 
     for group in groups:
         for name in list(getattr(group, "layer_names", ()) or ()):
@@ -292,7 +292,7 @@ def validate_native432_runtime_registration(
             )
             strides = _tensor_strides(tensor)
             packed_intervals.setdefault((storage_key, strides[0]), []).append(
-                (offset, end)
+                (offset, end, name)
             )
 
     for role, expected in (
@@ -312,13 +312,16 @@ def validate_native432_runtime_registration(
     for (storage_key, _), intervals in packed_intervals.items():
         intervals.sort()
         previous_end: int | None = None
-        for start, end in intervals:
+        previous_name = ""
+        for start, end, name in intervals:
             if previous_end is not None and start < previous_end:
                 _fail(
                     f"native432 packed views overlap on storage {storage_key!r}: "
-                    f"[{start},{end}) inside [{intervals[0][0]},{previous_end})"
+                    f"{name!r} [{start},{end}) overlaps {previous_name!r} "
+                    f"ending at {previous_end}"
                 )
             previous_end = end
+            previous_name = name
 
 
 class Native432LMCacheMPConnector(LMCacheMPConnector):
