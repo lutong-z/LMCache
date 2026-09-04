@@ -318,58 +318,6 @@ def validate_native432_runtime_registration(
             )
 
 
-def filter_native432_registration(
-    kv_cache_config: Any,
-    kv_caches: dict[str, Any],
-) -> tuple[Any, dict[str, Any]]:
-    """Restrict LMCache registration to native432 (C4/C128/SWA) caches.
-
-    Indexer, compressor, and draft/MTP caches are excluded: their transfer
-    semantics are not prefix-cache-safe for this runtime (a single external
-    load poisons generation globally with NaN logits), and the native432 ABI
-    marks them as excluded roles. The returned config is a shallow copy with
-    only native layer names/tensor entries; the input is never mutated.
-    """
-    candidate_names = set(kv_caches)
-    if kv_cache_config is not None:
-        for group in getattr(kv_cache_config, "kv_cache_groups", ()) or ():
-            candidate_names.update(getattr(group, "layer_names", ()) or ())
-        for tensor_cfg in getattr(kv_cache_config, "kv_cache_tensors", ()) or ():
-            candidate_names.update(getattr(tensor_cfg, "shared_by", ()) or ())
-    native_names = {
-        name for name in candidate_names if _role_for_name(name) is not None
-    }
-    filtered_caches = {
-        name: tensor for name, tensor in kv_caches.items() if name in native_names
-    }
-    if kv_cache_config is None:
-        return None, filtered_caches
-
-    # Standard
-    import copy
-
-    filtered_config = copy.copy(kv_cache_config)
-    filtered_groups = []
-    for group in getattr(kv_cache_config, "kv_cache_groups", ()) or ():
-        layer_names = [
-            name
-            for name in (getattr(group, "layer_names", ()) or ())
-            if name in native_names
-        ]
-        if not layer_names:
-            continue
-        filtered_group = copy.copy(group)
-        filtered_group.layer_names = layer_names
-        filtered_groups.append(filtered_group)
-    filtered_config.kv_cache_groups = filtered_groups
-    filtered_config.kv_cache_tensors = [
-        tensor_cfg
-        for tensor_cfg in (getattr(kv_cache_config, "kv_cache_tensors", ()) or ())
-        if any(name in native_names for name in getattr(tensor_cfg, "shared_by", ()))
-    ]
-    return filtered_config, filtered_caches
-
-
 def neutralize_sliding_window_groups(engine_group_infos: list[Any]) -> list[Any]:
     """Force full-range transfers for sliding-window groups.
 
@@ -400,10 +348,11 @@ def neutralize_sliding_window_groups(engine_group_infos: list[Any]) -> list[Any]
 class Native432LMCacheMPConnector(LMCacheMPConnector):
     """LMCache MP connector gated on the native432 runtime mapping."""
     def __init__(self, vllm_config: Any, role: Any, kv_cache_config: Any = None):
-        # Keep the full config for the gate; LMCache sees only native432.
+        # LMCache must see EVERY engine group: vLLM marks connector-hit
+        # tokens as computed for all groups, so any group LMCache cannot
+        # load back becomes stale garbage (indexer/compressor/draft).
         self._native432_full_kv_cache_config = kv_cache_config
-        filtered_config, _ = filter_native432_registration(kv_cache_config, {})
-        super().__init__(vllm_config, role, filtered_config)
+        super().__init__(vllm_config, role, kv_cache_config)
 
     def register_kv_caches(self, kv_caches: dict[str, Any]):
         # First Party
@@ -419,18 +368,16 @@ class Native432LMCacheMPConnector(LMCacheMPConnector):
         if full_config is None:
             full_config = getattr(self, "_kv_cache_config", None)
         validate_native432_runtime_registration(full_config, kv_caches)
-        filtered_config, filtered_caches = filter_native432_registration(
-            full_config, kv_caches
-        )
 
         # Mirror LMCacheMPConnector.register_kv_caches, but neutralize the
         # sliding-window metadata before the group infos reach the server.
+        # Registration covers ALL engine groups (see __init__ note).
         layout_hints = vllm_layout_hints()
         edited_caches = apply_kv_cache_group_edits(
-            filtered_config, filtered_caches, layout_hints=layout_hints
+            full_config, kv_caches, layout_hints=layout_hints
         )
         engine_group_infos = create_engine_group_infos_from_vllm(
-            filtered_config,
+            full_config,
             edited_caches,
             layout_hints=layout_hints,
         )
@@ -446,7 +393,6 @@ class Native432LMCacheMPConnector(LMCacheMPConnector):
                 self.dispatcher,
                 "register",
                 kv_caches=edited_caches,
-                kv_cache_config=filtered_config,
+                kv_cache_config=full_config,
                 vllm_config=self._vllm_config,
             )
-        return
