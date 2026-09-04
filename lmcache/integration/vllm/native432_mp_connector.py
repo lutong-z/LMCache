@@ -370,9 +370,35 @@ def filter_native432_registration(
     return filtered_config, filtered_caches
 
 
+def neutralize_sliding_window_groups(engine_group_infos: list[Any]) -> list[Any]:
+    """Force full-range transfers for sliding-window groups.
+
+    LMCache honours ``sw_size_tokens`` by transferring only the window tail
+    of each chunk. For DSv4 that under-covers what vLLM already marked as
+    computed (the hybrid SWA/eagle path reads past the tail at chunk
+    boundaries), which derails generation for every later request. Full
+    transfers are a correct superset: the SWA kernel reads only its window.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    return [
+        (
+            EngineGroupInfo(
+                engine_group_id=info.engine_group_id,
+                layer_indices=info.layer_indices,
+                tokens_per_block=info.tokens_per_block,
+                sw_size_tokens=-1,
+            )
+            if getattr(info, "sw_size_tokens", -1) > 0
+            else info
+        )
+        for info in engine_group_infos
+    ]
+
+
 class Native432LMCacheMPConnector(LMCacheMPConnector):
     """LMCache MP connector gated on the native432 runtime mapping."""
-
     def __init__(self, vllm_config: Any, role: Any, kv_cache_config: Any = None):
         # Keep the full config for the gate; LMCache sees only native432.
         self._native432_full_kv_cache_config = kv_cache_config
@@ -380,9 +406,47 @@ class Native432LMCacheMPConnector(LMCacheMPConnector):
         super().__init__(vllm_config, role, filtered_config)
 
     def register_kv_caches(self, kv_caches: dict[str, Any]):
+        # First Party
+        from lmcache.integration.vllm.kv_cache_group_edits import (
+            apply_kv_cache_group_edits,
+        )
+        from lmcache.integration.vllm.kv_cache_groups import (
+            create_engine_group_infos_from_vllm,
+        )
+        from lmcache.integration.vllm.utils import vllm_layout_hints
+
         full_config = getattr(self, "_native432_full_kv_cache_config", None)
         if full_config is None:
             full_config = getattr(self, "_kv_cache_config", None)
         validate_native432_runtime_registration(full_config, kv_caches)
-        _, filtered_caches = filter_native432_registration(full_config, kv_caches)
-        return super().register_kv_caches(filtered_caches)
+        filtered_config, filtered_caches = filter_native432_registration(
+            full_config, kv_caches
+        )
+
+        # Mirror LMCacheMPConnector.register_kv_caches, but neutralize the
+        # sliding-window metadata before the group infos reach the server.
+        layout_hints = vllm_layout_hints()
+        edited_caches = apply_kv_cache_group_edits(
+            filtered_config, filtered_caches, layout_hints=layout_hints
+        )
+        engine_group_infos = create_engine_group_infos_from_vllm(
+            filtered_config,
+            edited_caches,
+            layout_hints=layout_hints,
+        )
+        engine_group_infos = neutralize_sliding_window_groups(engine_group_infos)
+        self.worker_adapter.register_kv_caches(
+            edited_caches, engine_group_infos=engine_group_infos
+        )
+        if self.dispatcher is not None:
+            # First Party
+            from lmcache.integration.vllm.experimental import dispatch
+
+            dispatch(
+                self.dispatcher,
+                "register",
+                kv_caches=edited_caches,
+                kv_cache_config=filtered_config,
+                vllm_config=self._vllm_config,
+            )
+        return

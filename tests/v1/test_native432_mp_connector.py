@@ -381,29 +381,73 @@ def test_filter_native432_registration_drops_excluded_roles():
 
 
 
-def test_connector_gate_runs_before_parent_registration(monkeypatch):
-    calls: list[str] = []
-
-    def _fake_parent_register(self, kv_caches):
-        calls.append("parent")
-
-    monkeypatch.setattr(LMCacheMPConnector, "register_kv_caches", _fake_parent_register)
+def test_connector_gate_runs_before_parent_registration():
     connector = object.__new__(Native432LMCacheMPConnector)
+    connector._native432_full_kv_cache_config = None
     connector._kv_cache_config = None
     with pytest.raises(Native432RegistrationError):
         connector.register_kv_caches({})
-    assert calls == []
 
 
-def test_connector_delegates_after_gate(monkeypatch):
-    calls: list[str] = []
+def test_neutralize_sliding_window_groups():
+    from lmcache.integration.vllm.native432_mp_connector import (
+        neutralize_sliding_window_groups,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
-    def _fake_parent_register(self, kv_caches):
-        calls.append("parent")
+    infos = [
+        EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), tokens_per_block=64,
+            sw_size_tokens=128,
+        ),
+        EngineGroupInfo(
+            engine_group_id=1, layer_indices=(2, 3), tokens_per_block=256,
+            sw_size_tokens=-1,
+        ),
+    ]
+    out = neutralize_sliding_window_groups(infos)
+    assert out[0].sw_size_tokens == -1
+    assert out[0].layer_indices == (0, 1)
+    assert out[0].tokens_per_block == 64
+    assert out[1] is infos[1]
 
-    monkeypatch.setattr(LMCacheMPConnector, "register_kv_caches", _fake_parent_register)
+
+def test_connector_registers_native_subset_with_neutralized_window(monkeypatch):
+    calls: list[tuple[dict, list]] = []
+
+    class _Adapter:
+        def register_kv_caches(self, kv_caches, engine_group_infos=()):
+            calls.append((kv_caches, list(engine_group_infos)))
+
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.kv_cache_group_edits.apply_kv_cache_group_edits",
+        lambda cfg, caches, layout_hints=None: caches,
+    )
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.kv_cache_groups.create_engine_group_infos_from_vllm",
+        lambda cfg, caches, layout_hints=None: [
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(0, 1),
+                tokens_per_block=64,
+                sw_size_tokens=128,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.utils.vllm_layout_hints", lambda: {}
+    )
     config, kv_caches = _valid_runtime()
     connector = object.__new__(Native432LMCacheMPConnector)
+    connector._native432_full_kv_cache_config = config
     connector._kv_cache_config = config
+    connector.worker_adapter = _Adapter()
+    connector.dispatcher = None
     connector.register_kv_caches(kv_caches)
-    assert calls == ["parent"]
+    assert len(calls) == 1
+    registered_caches, infos = calls[0]
+    assert set(registered_caches) <= set(kv_caches)
+    assert not any("indexer" in name for name in registered_caches)
+    assert all(info.sw_size_tokens == -1 for info in infos)
