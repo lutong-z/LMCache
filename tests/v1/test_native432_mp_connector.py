@@ -100,15 +100,19 @@ def _valid_runtime():
     """Full mapped inventory with packed, non-overlapping layer views."""
     config = _Config()
     kv_caches: dict[str, _FakeTensor] = {}
-    for role, layer_ids in (
-        ("c4", sorted(NATIVE432_C4_LAYER_IDS)),
-        ("c128", sorted(NATIVE432_C128_LAYER_IDS)),
-        ("swa", sorted(NATIVE432_SWA_LAYER_IDS)),
+    for role, layer_ids, name_fn in (
+        ("c4", sorted(NATIVE432_C4_LAYER_IDS), _layer_name),
+        ("c128", sorted(NATIVE432_C128_LAYER_IDS), _layer_name),
+        (
+            "swa",
+            sorted(NATIVE432_SWA_LAYER_IDS),
+            lambda layer_id: f"{_layer_name(layer_id)}.swa_cache",
+        ),
     ):
         _, _, slots = NATIVE432_ROLE_GEOMETRY[role]
         page_bytes = slots * NATIVE432_RECORD_BYTES
         storage_key = hash(role) & 0xFFFF
-        names = [_layer_name(layer_id) for layer_id in layer_ids]
+        names = [name_fn(layer_id) for layer_id in layer_ids]
         for index, name in enumerate(names):
             offset = index * page_bytes
             kv_caches[name] = _native_tensor(role, offset=offset, storage_key=storage_key)
@@ -137,7 +141,7 @@ def test_missing_config_fails():
 
 def test_missing_layer_tensor_fails():
     config, kv_caches = _valid_runtime()
-    del kv_caches[_layer_name(sorted(NATIVE432_SWA_LAYER_IDS)[0])]
+    del kv_caches[f"{_layer_name(sorted(NATIVE432_SWA_LAYER_IDS)[0])}.swa_cache"]
     with pytest.raises(Native432RegistrationError):
         validate_native432_runtime_registration(config, kv_caches)
 
