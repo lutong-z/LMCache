@@ -159,6 +159,7 @@ def _valid_runtime():
             config.kv_cache_tensors.append(
                 _CfgTensor(size=kv_caches[name].numel(), shared_by=[name])
             )
+    return config, kv_caches
 
 
 def test_valid_mapped_inventory_passes():
