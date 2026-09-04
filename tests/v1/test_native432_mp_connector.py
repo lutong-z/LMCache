@@ -180,6 +180,37 @@ def test_missing_layer_tensor_fails():
         validate_native432_runtime_registration(config, kv_caches)
 
 
+def test_interleaved_group_views_on_shared_slab_pass():
+    """Runtime layout: SWA and C4 views interleave in one packed slab."""
+    config, kv_caches = _valid_runtime()
+    swa_name = _swa_name(0)
+    mla_name = _mla_name(2)
+    shared_storage = 0xDEADBEEF
+    block_stride = 860160
+    swa_tensor = _FakeTensor(
+        (11074, 64, NATIVE432_RECORD_BYTES),
+        (block_stride, NATIVE432_RECORD_BYTES, 1),
+        offset=0,
+        storage_key=shared_storage,
+    )
+    mla_tensor = _FakeTensor(
+        (11047, 64, NATIVE432_RECORD_BYTES),
+        (block_stride, NATIVE432_RECORD_BYTES, 1),
+        offset=8704,
+        storage_key=shared_storage,
+    )
+    kv_caches[swa_name] = swa_tensor
+    kv_caches[mla_name] = mla_tensor
+    for name, tensor in ((swa_name, swa_tensor), (mla_name, mla_tensor)):
+        cfg = next(cfg for cfg in config.kv_cache_tensors if cfg.shared_by == [name])
+        cfg.offset = tensor.storage_offset()
+        cfg.block_stride = block_stride
+        cfg.size = tensor.shape[0] * block_stride
+    validate_native432_runtime_registration(config, kv_caches)
+
+
+
+
 def test_missing_layer_group_fails():
     config, kv_caches = _valid_runtime()
     swa_group = next(

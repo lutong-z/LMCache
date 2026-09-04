@@ -238,8 +238,11 @@ def validate_native432_runtime_registration(
     seen_aliases: set[str] = set()
     validated_cfgs: set[int] = set()
     role_layers: dict[str, set[int]] = {"c4": set(), "c128": set(), "swa": set()}
-    # (storage key, dim0 stride) -> sorted list of (offset, end, name) views
-    packed_intervals: dict[tuple[Any, int], list[tuple[int, int, str]]] = {}
+    # (storage key, dim0 stride, offset) -> first view name. Groups own
+    # disjoint block-id pools over one shared slab, so per-block byte ranges
+    # of different groups may interleave legitimately; identical view
+    # signatures across distinct kv_cache_tensors are never legitimate.
+    view_signatures: dict[tuple[Any, int, int], str] = {}
 
     for group in groups:
         for name in list(getattr(group, "layer_names", ()) or ()):
@@ -291,9 +294,14 @@ def validate_native432_runtime_registration(
                 name, tensor, tensor_cfg, role=role
             )
             strides = _tensor_strides(tensor)
-            packed_intervals.setdefault((storage_key, strides[0]), []).append(
-                (offset, end, name)
-            )
+            signature = (storage_key, strides[0], offset)
+            previous = view_signatures.get(signature)
+            if previous is not None:
+                _fail(
+                    f"native432 view {name!r} duplicates {previous!r} at "
+                    f"storage offset {offset}"
+                )
+            view_signatures[signature] = name
 
     for role, expected in (
         ("c4", NATIVE432_C4_LAYER_IDS),
@@ -309,19 +317,6 @@ def validate_native432_runtime_registration(
                 f"extra={extra!r}"
             )
 
-    for (storage_key, _), intervals in packed_intervals.items():
-        intervals.sort()
-        previous_end: int | None = None
-        previous_name = ""
-        for start, end, name in intervals:
-            if previous_end is not None and start < previous_end:
-                _fail(
-                    f"native432 packed views overlap on storage {storage_key!r}: "
-                    f"{name!r} [{start},{end}) overlaps {previous_name!r} "
-                    f"ending at {previous_end}"
-                )
-            previous_end = end
-            previous_name = name
 
 
 class Native432LMCacheMPConnector(LMCacheMPConnector):
