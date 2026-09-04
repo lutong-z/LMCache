@@ -210,6 +210,7 @@ def _validate_native_tensor(
                 f"{role} tensor {name!r} numel {view_numel} disagrees "
                 f"with stamped size {size}"
             )
+    return _tensor_storage_key(tensor), offset, offset + page_bytes
 
 
 def validate_native432_runtime_registration(
