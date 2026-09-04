@@ -380,10 +380,9 @@ class Native432LMCacheMPConnector(LMCacheMPConnector):
         super().__init__(vllm_config, role, filtered_config)
 
     def register_kv_caches(self, kv_caches: dict[str, Any]):
-        validate_native432_runtime_registration(
-            self._native432_full_kv_cache_config, kv_caches
-        )
-        _, filtered_caches = filter_native432_registration(
-            self._native432_full_kv_cache_config, kv_caches
-        )
+        full_config = getattr(self, "_native432_full_kv_cache_config", None)
+        if full_config is None:
+            full_config = getattr(self, "_kv_cache_config", None)
+        validate_native432_runtime_registration(full_config, kv_caches)
+        _, filtered_caches = filter_native432_registration(full_config, kv_caches)
         return super().register_kv_caches(filtered_caches)
