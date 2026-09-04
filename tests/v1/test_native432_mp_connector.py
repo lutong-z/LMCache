@@ -120,12 +120,13 @@ def _valid_runtime():
         for index, name in enumerate(names):
             offset = index * page_bytes
             kv_caches[name] = _native_tensor(role, offset=offset, storage_key=storage_key)
+            block_stride = len(names) * page_bytes
             config.kv_cache_tensors.append(
                 _CfgTensor(
-                    size=kv_caches[name].numel(),
+                    size=kv_caches[name].shape[0] * block_stride,
                     shared_by=[name],
                     offset=offset,
-                    block_stride=len(names) * page_bytes,
+                    block_stride=block_stride,
                 )
             )
         config.kv_cache_groups.append(_Group(layer_names=names))

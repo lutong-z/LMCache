@@ -194,13 +194,22 @@ def _validate_native_tensor(
         )
     size = getattr(tensor_cfg, "size", None)
     if size is not None:
+        # Packed layout: size covers whole blocks (block_stride bytes each);
+        # the per-layer view is only slots*432 of every block.
+        expected = shape[0] * block_stride if block_stride > 0 else None
         numel_fn = getattr(tensor, "numel", None)
-        if callable(numel_fn) and int(numel_fn()) != int(size):
+        view_numel = int(numel_fn()) if callable(numel_fn) else None
+        if expected is not None:
+            if int(size) != expected:
+                _fail(
+                    f"{role} tensor {name!r} stamped size {size} disagrees "
+                    f"with {shape[0]} blocks at block_stride {block_stride}"
+                )
+        elif view_numel is not None and view_numel != int(size):
             _fail(
-                f"{role} tensor {name!r} numel {int(numel_fn())} disagrees "
+                f"{role} tensor {name!r} numel {view_numel} disagrees "
                 f"with stamped size {size}"
             )
-    return _tensor_storage_key(tensor), offset, offset + page_bytes
 
 
 def validate_native432_runtime_registration(
