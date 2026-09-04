@@ -173,9 +173,48 @@ def all_null_chunk_masks(
     return masks
 
 
+def _kernel_group_window_layout(
+    cache_context: BaseCacheContext,
+    num_chunks: int,
+) -> list[tuple[int, int, int]]:
+    """Per-kernel-group (skip_chunks, keep_blocks, total_blocks) layout.
+
+    ``skip_chunks`` is how many leading chunks the group's sliding window
+    makes irrelevant; ``keep_blocks`` is the blocks kept per in-window chunk;
+    ``total_blocks`` is the blocks in one full chunk.
+    """
+    kv_groups_manager = cache_context.kv_layer_groups_manager
+    attn_desc = kv_groups_manager.get_attn_desc()
+    object_group_of_kernel: dict[int, int] = {}
+    for obj_group_id, obj_group in enumerate(kv_groups_manager.object_groups):
+        for kernel_group_id in obj_group.kernel_group_indices:
+            object_group_of_kernel[kernel_group_id] = obj_group_id
+    layout = []
+    for kernel_group_id in range(kv_groups_manager.num_kernel_groups):
+        window_chunks = attn_desc.num_chunks_in_sw[
+            object_group_of_kernel[kernel_group_id]
+        ]
+        skip_chunks = (
+            0 if window_chunks < 0 else max(0, num_chunks - window_chunks)
+        )
+        tokens_per_window = min(
+            cache_context.lmcache_tokens_per_chunk,
+            kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
+        )
+        keep_blocks = cache_context.calculate_num_blocks(
+            tokens_per_window, kernel_group_id
+        )
+        total_blocks = cache_context.calculate_num_blocks(
+            cache_context.lmcache_tokens_per_chunk, kernel_group_id
+        )
+        layout.append((skip_chunks, keep_blocks, total_blocks))
+    return layout
+
+
 def downsample_and_stage_block_ids(
     cache_context: BaseCacheContext,
     block_ids: list[list[int]],
+    num_chunks: int = 0,
 ) -> list[torch.Tensor]:
     """Cut the block id lists to skip the unneeded blocks in a chunk and
     stage it into GPU tensors for later use.
@@ -185,9 +224,15 @@ def downsample_and_stage_block_ids(
 
     Note that the we do NOT do any object-level skipping here.
 
+    Groups whose list is already the exact in-window tail (the engine's
+    skip-aware allocation for sliding-window groups) are left-padded with
+    null block id 0 up to the downsampled length; the padded entries are
+    never read because the transfer starts at the first in-window chunk.
+
     Args:
         cache_context: The cache context containing the KV cache information.
         block_ids: The original block id lists, indexed by LMCache KV group index.
+        num_chunks: Chunk count of the transfer range (0 = derive from lists).
 
     Returns:
         The cut block id lists, indexed by LMCache KV group index.
@@ -215,6 +260,7 @@ def downsample_and_stage_block_ids(
         ]
     """
     num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
+    window_layout = _kernel_group_window_layout(cache_context, num_chunks)
     for kernel_group_id in range(num_kernel_groups):
         subchunk_sw_size_tokens = (
             cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
@@ -233,6 +279,19 @@ def downsample_and_stage_block_ids(
 
         new_block_ids = []
         old_block_ids = block_ids[kernel_group_id]
+        skip_chunks, keep_w, _total_w = window_layout[kernel_group_id]
+        expected_cut = (num_chunks - skip_chunks) * keep_w
+        if len(old_block_ids) == expected_cut and expected_cut != (
+            num_chunks * total_blocks_per_chunk
+        ):
+            # Engine already supplied exactly the in-window tail (vLLM's
+            # skip-aware sliding-window allocation). Left-pad to the
+            # downsampled length; padded entries are never read because the
+            # transfer begins at the first in-window chunk.
+            padded = [0] * (num_chunks * keep_w - len(old_block_ids))
+            new_block_ids = padded + list(old_block_ids)
+            block_ids[kernel_group_id] = new_block_ids
+            continue
         assert len(old_block_ids) % total_blocks_per_chunk == 0, (
             f"len(block_ids[{kernel_group_id}]) should be a multiple "
             f"of total_blocks_per_chunk ({total_blocks_per_chunk}), but got "
@@ -1096,7 +1155,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
 
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
+                cache_context, gpu_block_ids, num_chunks=num_chunks
             )
 
             producer_event = event_backend.import_event(
@@ -1311,16 +1370,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ):
             event = event_backend.create_event(cache_context.device)
 
-            # Fail closed: a short block-id list would drive the transfer
-            # kernel to write out-of-bounds GPU memory. Checked on the raw
-            # block ids, before cutting drops the per-chunk blocks that
-            # sliding-window groups do not need.
-            if any(
-                len(group_block_ids) < num_chunks * bpc
-                for group_block_ids, bpc in zip(
-                    gpu_block_ids, blocks_per_chunk, strict=True
-                )
+            # Fail closed on genuinely short block-id lists: they would drive
+            # the transfer kernel out of bounds. A group whose list is exactly
+            # the in-window tail (vLLM's skip-aware sliding-window allocation)
+            # is NOT an underflow — the tail is all the transfer will read.
+            window_layout = _kernel_group_window_layout(cache_context, num_chunks)
+            underflow = False
+            for group_block_ids, (skip_chunks, keep_w, total_w) in zip(
+                gpu_block_ids, window_layout, strict=True
             ):
+                full_len = num_chunks * total_w
+                tail_len = (num_chunks - skip_chunks) * keep_w
+                if len(group_block_ids) not in (full_len, tail_len):
+                    underflow = True
+                    break
+            if underflow:
                 logger.error(
                     "RETRIEVE block ID underflow for request_id=%s: each group "
                     "needs num_chunks * blocks_per_chunk block IDs for %d "
@@ -1335,7 +1399,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             # Cut and stage all block_ids to GPU once before the transfer
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
+                cache_context, gpu_block_ids, num_chunks=num_chunks
             )
             producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device

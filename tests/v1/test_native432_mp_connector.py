@@ -354,30 +354,8 @@ def test_connector_gate_runs_before_parent_registration():
         connector.register_kv_caches({})
 
 
-def test_neutralize_sliding_window_groups():
-    from lmcache.integration.vllm.native432_mp_connector import (
-        neutralize_sliding_window_groups,
-    )
-    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
-    infos = [
-        EngineGroupInfo(
-            engine_group_id=0, layer_indices=(0, 1), tokens_per_block=64,
-            sw_size_tokens=128,
-        ),
-        EngineGroupInfo(
-            engine_group_id=1, layer_indices=(2, 3), tokens_per_block=256,
-            sw_size_tokens=-1,
-        ),
-    ]
-    out = neutralize_sliding_window_groups(infos)
-    assert out[0].sw_size_tokens == -1
-    assert out[0].layer_indices == (0, 1)
-    assert out[0].tokens_per_block == 64
-    assert out[1] is infos[1]
-
-
-def test_connector_registers_all_groups_with_neutralized_window(monkeypatch):
+def test_connector_registers_all_groups_with_window_metadata(monkeypatch):
     calls: list[tuple[dict, list]] = []
 
     class _Adapter:
@@ -415,4 +393,4 @@ def test_connector_registers_all_groups_with_neutralized_window(monkeypatch):
     registered_caches, infos = calls[0]
     # Registration must cover every engine group (coverage gap breaks hits).
     assert set(registered_caches) == set(kv_caches)
-    assert all(info.sw_size_tokens == -1 for info in infos)
+    assert all(info.sw_size_tokens == 128 for info in infos)

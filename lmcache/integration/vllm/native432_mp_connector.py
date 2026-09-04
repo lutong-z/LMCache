@@ -318,31 +318,6 @@ def validate_native432_runtime_registration(
             )
 
 
-def neutralize_sliding_window_groups(engine_group_infos: list[Any]) -> list[Any]:
-    """Force full-range transfers for sliding-window groups.
-
-    LMCache honours ``sw_size_tokens`` by transferring only the window tail
-    of each chunk. For DSv4 that under-covers what vLLM already marked as
-    computed (the hybrid SWA/eagle path reads past the tail at chunk
-    boundaries), which derails generation for every later request. Full
-    transfers are a correct superset: the SWA kernel reads only its window.
-    """
-    # First Party
-    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-
-    return [
-        (
-            EngineGroupInfo(
-                engine_group_id=info.engine_group_id,
-                layer_indices=info.layer_indices,
-                tokens_per_block=info.tokens_per_block,
-                sw_size_tokens=-1,
-            )
-            if getattr(info, "sw_size_tokens", -1) > 0
-            else info
-        )
-        for info in engine_group_infos
-    ]
 
 
 class Native432LMCacheMPConnector(LMCacheMPConnector):
@@ -369,8 +344,10 @@ class Native432LMCacheMPConnector(LMCacheMPConnector):
             full_config = getattr(self, "_kv_cache_config", None)
         validate_native432_runtime_registration(full_config, kv_caches)
 
-        # Mirror LMCacheMPConnector.register_kv_caches, but neutralize the
-        # sliding-window metadata before the group infos reach the server.
+        # Mirror LMCacheMPConnector.register_kv_caches; the sliding-window
+        # metadata stays intact: the server (started with
+        # --separate-object-groups) transfers exactly the in-window tail that
+        # vLLM allocates for sliding-window groups.
         # Registration covers ALL engine groups (see __init__ note).
         layout_hints = vllm_layout_hints()
         edited_caches = apply_kv_cache_group_edits(
@@ -381,7 +358,6 @@ class Native432LMCacheMPConnector(LMCacheMPConnector):
             edited_caches,
             layout_hints=layout_hints,
         )
-        engine_group_infos = neutralize_sliding_window_groups(engine_group_infos)
         self.worker_adapter.register_kv_caches(
             edited_caches, engine_group_infos=engine_group_infos
         )
