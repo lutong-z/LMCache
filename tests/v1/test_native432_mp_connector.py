@@ -345,6 +345,42 @@ def test_non_native_draft_group_is_ignored():
     validate_native432_runtime_registration(config, kv_caches)
 
 
+def test_filter_native432_registration_drops_excluded_roles():
+    config, kv_caches = _valid_runtime()
+    from lmcache.integration.vllm.native432_mp_connector import (
+        filter_native432_registration,
+    )
+
+    filtered_config, filtered_caches = filter_native432_registration(config, kv_caches)
+    assert filtered_caches
+    assert all(
+        name.endswith(".attn") or name.endswith(".swa_cache")
+        for name in filtered_caches
+    )
+    assert not any("indexer" in name for name in filtered_caches)
+    assert not any("compressor" in name for name in filtered_caches)
+    assert len(filtered_caches) == 21 + 20 + 43
+    kept_names = set(filtered_caches)
+    assert all(
+        name in kept_names
+        for group in filtered_config.kv_cache_groups
+        for name in group.layer_names
+    )
+    assert all(
+        alias in kept_names
+        for tensor_cfg in filtered_config.kv_cache_tensors
+        for alias in tensor_cfg.shared_by
+    )
+    # Input config must not be mutated.
+    assert any(
+        "indexer" in name
+        for group in config.kv_cache_groups
+        for name in group.layer_names
+    )
+
+
+
+
 def test_connector_gate_runs_before_parent_registration(monkeypatch):
     calls: list[str] = []
 
