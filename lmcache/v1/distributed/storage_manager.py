@@ -152,6 +152,7 @@ class StorageManager:
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
+            l1_reserve_batch_keys=config.prefetch_l1_reserve_batch_keys,
         )
         self._prefetch_controller.start()
 

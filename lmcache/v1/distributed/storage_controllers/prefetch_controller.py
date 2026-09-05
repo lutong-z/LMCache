@@ -266,6 +266,9 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The prefetch policy for load plan decisions.
         max_in_flight: Maximum number of concurrent prefetch requests.
+        l1_reserve_batch_keys: Maximum keys reserved per L1 write-buffer
+            batch. Bounds each atomic allocation so a large restore
+            degrades to a prefix window instead of failing all-or-nothing.
     """
 
     # Singleton dispatch for the in-flight load gauges: tests may construct
@@ -282,6 +285,7 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[AdapterDescriptor],
         policy: PrefetchPolicy,
         max_in_flight: int = 8,
+        l1_reserve_batch_keys: int = 32,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters: dict[int, L2AdapterInterface] = {
@@ -293,6 +297,7 @@ class PrefetchController(StorageControllerInterface):
         }
         self._policy = policy
         self._max_in_flight = max_in_flight
+        self._l1_reserve_batch_keys = max(1, l1_reserve_batch_keys)
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -1005,8 +1010,11 @@ class PrefetchController(StorageControllerInterface):
             )
 
         # Step 3 — reserve L1 write buffers for the plan keys.
-        # If any failure (OOM or contention or others) happens,
-        # we fall back to the L1-only longest hit (`l1_fallback_retain`).
+        # Reservation runs in bounded prefix-ordered windows. When only part
+        # of the plan is reservable (OOM or contention), the load degrades
+        # to the longest reservable prefix instead of abandoning the whole
+        # restore; the all-or-nothing fallback only remains for the case
+        # where nothing could be reserved at all.
         # SW keys in L2 (and not in L1):
         # |out of L1-hit sw|in L1-hit sw|out of L2-hit sw|in L2-hit sw| remaining  |
         #                               ^ L1 hit length               ^ L1+L2 hit length
@@ -1014,10 +1022,63 @@ class PrefetchController(StorageControllerInterface):
         keys_to_reserve = merge_bitmaps(trimmed_plan.values(), num_keys).gather(
             request.keys
         )
-        reserved = self._reserve_load_buffers(request, keys_to_reserve)
-        if len(reserved) < len(keys_to_reserve):
+        reserved, contended_keys = self._reserve_load_buffers(
+            request, keys_to_reserve
+        )
+        if contended_keys:
+            # A contended key is owned by a concurrent writer; loading an
+            # overlapping copy is a correctness hazard, so the whole L2
+            # load is abandoned (all-or-nothing).
             self._finish_request(request)
             return
+        if len(reserved) < len(keys_to_reserve):
+            if not reserved:
+                self._finish_request(request)
+                return
+            # Truncate to the retained subset of the reservable prefix using
+            # the same fold as partial load failures.
+            key_index = {key: i for i, key in enumerate(request.keys)}
+            reserved_bitmap = Bitmap(num_keys)
+            for key in reserved:
+                reserved_bitmap.set(key_index[key])
+            union_bitmap = reserved_bitmap | request.l1_readlocks
+            hit_length, retained = build_trim_mask(
+                union_bitmap, num_keys, request.policy, request.attn_desc
+            )
+            trimmed_plan = trim_load_plan_with_mask(trimmed_plan, retained)
+
+            # Release write buffers whose keys fell outside the truncated
+            # plan; they will never be loaded.
+            planned_keys = (
+                set(
+                    merge_bitmaps(trimmed_plan.values(), num_keys).gather(
+                        request.keys
+                    )
+                )
+                if trimmed_plan
+                else set()
+            )
+            dropped = [
+                key for key in request.write_reserved_keys if key not in planned_keys
+            ]
+            if dropped:
+                for key in dropped:
+                    request.write_reserved_objs.pop(key, None)
+                request.write_reserved_keys = [
+                    key for key in request.write_reserved_keys if key in planned_keys
+                ]
+                self._l1_manager.finish_write(dropped)
+                self._l1_manager.delete(dropped)
+                logger.info(
+                    "Prefetch request %d: truncated L2 load to %d keys "
+                    "(%d dropped after partial L1 reservation)",
+                    request.request_id,
+                    len(planned_keys),
+                    len(dropped),
+                )
+            if not trimmed_plan:
+                self._finish_request(request)
+                return
         request.load_plan = trimmed_plan
 
         # Step 4 — free L2 lookup locks for keys outside the plan.
@@ -1048,15 +1109,18 @@ class PrefetchController(StorageControllerInterface):
 
         Successful reservations are recorded on
         ``request.write_reserved_keys`` / ``request.write_reserved_objs``.
-        Failures publish an ``L2_PREFETCH_FAILED`` event; the caller
-        abandons the L2 load if any key failed (all-or-nothing).
+        Failures publish an ``L2_PREFETCH_FAILED`` event. Contended keys
+        (write-locked by a concurrent request) abort the whole load: an
+        overlapping copy would be a correctness hazard. Out-of-memory keys
+        only truncate the reservable prefix.
 
         Args:
             request: The in-flight request the buffers belong to.
             keys_to_reserve: Keys in the trimmed load plan, in prefix order.
 
         Returns:
-            The subset of ``keys_to_reserve`` that now holds a write buffer.
+            A tuple of the subset of ``keys_to_reserve`` that now holds a
+            write buffer and the keys that failed due to contention.
         """
         # WARM retains every loaded key; LOOKUP follows the configured policy.
         if request.mode is PrefetchMode.WARM:
@@ -1068,19 +1132,24 @@ class PrefetchController(StorageControllerInterface):
         retention_map = dict(zip(keys_to_reserve, retentions, strict=True))
 
         # Batch reserve_write by object_group_id so each group uses its own
-        # tensor shapes.
+        # tensor shapes. Inside a group, reserve in bounded prefix-ordered
+        # windows so a large restore degrades to the reservable prefix
+        # instead of failing the whole batch atomically.
         write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
         by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
+        batch = self._l1_reserve_batch_keys
         for gid, group_iter in groupby(by_group, key=attrgetter("object_group_id")):
             group_keys = list(group_iter)
             gld = request.group_layout_descs[gid]
-            gr = self._l1_manager.reserve_write(
-                keys=group_keys,
-                is_temporary=[not retention_map[k] for k in group_keys],
-                layout_desc=gld,
-                mode="new",
-            )
-            write_results.update(gr)
+            for start in range(0, len(group_keys), batch):
+                window_keys = group_keys[start : start + batch]
+                gr = self._l1_manager.reserve_write(
+                    keys=window_keys,
+                    is_temporary=[not retention_map[k] for k in window_keys],
+                    layout_desc=gld,
+                    mode="new",
+                )
+                write_results.update(gr)
 
         reserved: set[ObjectKey] = set()
         oom_keys: list[ObjectKey] = []
@@ -1124,7 +1193,7 @@ class PrefetchController(StorageControllerInterface):
                     metadata={"reason": "l1_contended", "keys": contended_keys},
                 )
             )
-        return reserved
+        return reserved, contended_keys
 
     def _submit_load_tasks(
         self,

@@ -309,6 +309,46 @@ def downsample_and_stage_block_ids(
     return block_ids_gpu
 
 
+def _slice_block_ids_for_window(
+    cache_context: BaseCacheContext,
+    block_ids_gpu: list[torch.Tensor],
+    start_chunk: int,
+    num_chunks: int,
+) -> list[torch.Tensor]:
+    """Slice staged (downsampled) block ids to one chunk window.
+
+    ``downsample_and_stage_block_ids`` lays out each kernel group's tensor
+    as ``num_chunks_total * keep_blocks_per_chunk`` entries in full-range
+    chunk coordinates, so a window is a contiguous slice per group.
+
+    Args:
+        cache_context: The cache context containing the KV cache information.
+        block_ids_gpu: Staged block id tensors per kernel group.
+        start_chunk: First full-range chunk index of the window.
+        num_chunks: Number of chunks in the window.
+
+    Returns:
+        Per-kernel-group block id slices covering exactly the window.
+    """
+    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
+    sliced: list[torch.Tensor] = []
+    for kernel_group_id in range(num_kernel_groups):
+        subchunk_sw_size_tokens = (
+            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
+                kernel_group_id
+            )
+        )
+        tokens_per_chunk = min(
+            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
+        )
+        keep_blocks = cache_context.calculate_num_blocks(
+            tokens_per_chunk, kernel_group_id
+        )
+        start = start_chunk * keep_blocks
+        sliced.append(block_ids_gpu[kernel_group_id][start : start + num_chunks * keep_blocks])
+    return sliced
+
+
 def _recalculate_blocks_to_skip(
     blocks_per_chunk: int,
     blocks_per_window: int,
@@ -1419,51 +1459,71 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
+            window_chunks = max(1, self._ctx.retrieve_window_chunks)
             try:
                 for obj_group_id in range(num_object_groups):
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
-                    with self._ctx.storage_manager.read_prefetched_results(
-                        in_window_keys
-                    ) as window_objs:
-                        if not window_objs or len(window_objs) != len(in_window_keys):
-                            logger.error("Some keys not found during retrieve!")
-                            retrieve_succeeded = False
-                            break
+                    # Stream the restore through L1 in bounded chunk windows:
+                    # read-lock one window, enqueue its H2D copy, then release
+                    # that window's locks in stream order before locking the
+                    # next. L1 never holds more than one window per group.
+                    for w0 in range(0, len(in_window_keys), window_chunks):
+                        window_keys = in_window_keys[w0 : w0 + window_chunks]
+                        with self._ctx.storage_manager.read_prefetched_results(
+                            window_keys
+                        ) as window_objs:
+                            if not window_objs or len(window_objs) != len(
+                                window_keys
+                            ):
+                                logger.error("Some keys not found during retrieve!")
+                                retrieve_succeeded = False
+                                break
 
-                        total_bytes += sum(mo.get_size() for mo in window_objs)
+                            total_bytes += sum(mo.get_size() for mo in window_objs)
 
-                        # None-pad the skipped prefix to full length so the
-                        # transfer's ``num_objects_to_skip`` and block-id slicing
-                        # line up unchanged; the None entries are never read.
-                        memory_objs: list[MemoryObj | None] = [None] * skip + list(
-                            window_objs
-                        )
-
-                        transfer_kv_per_object_group(
-                            cache_context,
-                            block_ids_per_group_gpu,
-                            memory_objs,
-                            object_group_id=obj_group_id,
-                            batch_size=cache_context.max_batch_size,
-                            skip_first_n_tokens=skip_first_n_tokens,
-                            direction=lmcache_native.TransferDirection.H2D,
-                        )
-                        # Extend only after the copy is enqueued: on exception,
-                        # read_prefetched_results releases this group's locks
-                        # itself, and a key must not be released twice.
-                        prefetched_keys.extend(in_window_keys)
+                            # Window-local transfer: slice the staged block
+                            # ids to this chunk window and shift the skip
+                            # offset into window-local token coordinates.
+                            window_block_ids_gpu = _slice_block_ids_for_window(
+                                cache_context,
+                                block_ids_per_group_gpu,
+                                start_chunk=skip + w0,
+                                num_chunks=len(window_keys),
+                            )
+                            window_skip_tokens = max(
+                                0,
+                                skip_first_n_tokens
+                                - (skip + w0) * self._ctx.chunk_size,
+                            )
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                window_block_ids_gpu,
+                                list(window_objs),
+                                object_group_id=obj_group_id,
+                                batch_size=cache_context.max_batch_size,
+                                skip_first_n_tokens=window_skip_tokens,
+                                direction=lmcache_native.TransferDirection.H2D,
+                            )
+                            # Extend only after the copy is enqueued: on
+                            # exception, read_prefetched_results releases
+                            # this window's locks itself, and a key must not
+                            # be released twice.
+                            prefetched_keys.extend(window_keys)
+                            # Release this window's L1 read locks in stream
+                            # order, right after its copy completes.
+                            submit_callback_to_stream(
+                                cache_context.cupy_stream,
+                                "finish_read_prefetched",
+                                window_keys,
+                            )
+                    if not retrieve_succeeded:
+                        break
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
             finally:
                 event_backend.record_event(event, cache_context.stream)
-                if prefetched_keys:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_read_prefetched",
-                        prefetched_keys,
-                    )
                 num_tokens = (
                     num_chunks * self._ctx.chunk_size
                     if len(prefetched_keys) == expected_retained

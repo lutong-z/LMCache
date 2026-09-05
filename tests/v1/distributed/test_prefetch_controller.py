@@ -186,6 +186,21 @@ def store_keys_in_l2(
     assert ok, "Failed to store test data in L2 adapter"
 
 
+def make_tiny_l1_manager(size_in_bytes: int) -> L1Manager:
+    """Create an L1Manager with a tightly bounded memory pool."""
+    config = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(
+            size_in_bytes=size_in_bytes,
+            use_lazy=should_use_lazy_alloc(),
+            init_size_in_bytes=size_in_bytes,
+            align_bytes=0x1000,
+        ),
+        write_ttl_seconds=600,
+        read_ttl_seconds=300,
+    )
+    return L1Manager(config)
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -1887,3 +1902,128 @@ class TestSlidingWindowClaims:
 
         l1_manager.finish_read(keys[:4])
         l1_manager.finish_write([keys[4]])
+
+
+class TestWindowedReserve:
+    """Bounded L1 reserve batches and prefix-truncation fallback."""
+
+    def test_windowed_batches_still_load_full_plan(self, l1_manager):
+        """Small reserve windows must not change the full-hit outcome."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(5)]
+        store_keys_in_l2(adapter, keys, layout)
+
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+            l1_reserve_batch_keys=2,
+        )
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(PrefetchRequestSpec(keys, {0: layout}))
+        result = wait_for_prefetch_result(ctrl, req_id)
+        assert result == 5, f"Expected 5 prefix hits, got {result}"
+
+        read_results = l1_manager.unsafe_read(keys)
+        for key in keys:
+            assert read_results[key][0] == L1Error.SUCCESS
+        l1_manager.finish_read(keys)
+
+        ctrl.stop()
+        adapter.close()
+
+    def test_l1_pressure_truncates_instead_of_abandoning(self):
+        """A restore larger than L1 degrades to the reservable prefix
+        instead of reporting a zero hit (the old all-or-nothing abort)."""
+        # One test object is [100, 2, 512] bf16 = 204800 bytes. The
+        # allocator's minimum slab is 64 MiB, so 400 keys (~78 MiB) exceed
+        # any pool this test can build.
+        mgr = make_tiny_l1_manager(64 * 1024 * 1024)
+        adapter_config = MockL2AdapterConfig(max_size_gb=0.2, mock_bandwidth_gb=10.0)
+        adapter = MockL2Adapter(adapter_config)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(400)]
+        store_keys_in_l2(adapter, keys, layout)
+
+        ctrl = PrefetchController(
+            l1_manager=mgr,
+            l2_adapters=[adapter],
+            adapter_descriptors=[AdapterDescriptor(index=0, config=adapter_config)],
+            policy=DefaultPrefetchPolicy(),
+            l1_reserve_batch_keys=32,
+        )
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(PrefetchRequestSpec(keys, {0: layout}))
+        retained = wait_for_prefetch_result_bitmap(ctrl, req_id)
+        assert retained is not None, "prefetch request never completed"
+        result = retained.count_leading_ones()
+        assert 0 < result < 400, (
+            f"expected a truncated prefix hit, got {result} "
+            "(0 would be the old all-or-nothing abort)"
+        )
+
+        retained_keys = retained.gather(keys)
+        assert len(retained_keys) == result
+        read_results = mgr.unsafe_read(retained_keys)
+        for key in retained_keys:
+            assert read_results[key][0] == L1Error.SUCCESS
+        mgr.finish_read(retained_keys)
+
+        ctrl.stop()
+        adapter.close()
+        mgr.close()
+
+    def test_full_oom_falls_back_to_l1_only_hit(self):
+        """When not even one buffer fits, the request still completes and
+        reports the L1-only hit (zero here) without hanging or crashing."""
+        mgr = make_tiny_l1_manager(64 * 1024 * 1024)
+        adapter_config = MockL2AdapterConfig(max_size_gb=0.2, mock_bandwidth_gb=10.0)
+        adapter = MockL2Adapter(adapter_config)
+        layout = make_layout()
+
+        # Fill L1 and hold the read locks so the pool stays full.
+        fill_keys = [make_object_key(i) for i in range(400)]
+        store_keys_in_l2(adapter, fill_keys, layout)
+        ctrl = PrefetchController(
+            l1_manager=mgr,
+            l2_adapters=[adapter],
+            adapter_descriptors=[AdapterDescriptor(index=0, config=adapter_config)],
+            policy=DefaultPrefetchPolicy(),
+            l1_reserve_batch_keys=32,
+        )
+        ctrl.start()
+        fill_req = ctrl.submit_prefetch_request(
+            PrefetchRequestSpec(fill_keys, {0: layout})
+        )
+        fill_retained = wait_for_prefetch_result_bitmap(ctrl, fill_req)
+        assert fill_retained is not None
+        assert fill_retained.count_leading_ones() > 0
+
+        # Make each remaining key bigger than the free space so every
+        # reserve window fails: the request must complete with the L1-only
+        # hit instead of hanging or crashing.
+        used, total = mgr.get_memory_usage()
+        free = total - used
+        bytes_per_row = 2 * 512 * 2  # [N, 2, 512] bf16
+        rows = free // bytes_per_row + 1
+        big_layout = MemoryLayoutDesc(
+            shapes=[torch.Size([rows, 2, 512])],
+            dtypes=[torch.bfloat16],
+        )
+        new_keys = [make_object_key(1000 + i) for i in range(3)]
+        store_keys_in_l2(adapter, new_keys, big_layout)
+        req_id = ctrl.submit_prefetch_request(
+            PrefetchRequestSpec(new_keys, {0: big_layout})
+        )
+        result = wait_for_prefetch_result(ctrl, req_id)
+        assert result == 0, f"expected L1-only zero hit, got {result}"
+
+        mgr.finish_read(fill_retained.gather(fill_keys))
+
+        ctrl.stop()
+        adapter.close()
+        mgr.close()

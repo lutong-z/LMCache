@@ -106,11 +106,14 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw):
     kvlgm = SimpleNamespace(
         num_object_groups=num_object_groups,
         num_kernel_groups=num_object_groups,
+        object_groups=[_og([g]) for g in range(num_object_groups)],
         get_attn_desc=lambda: SimpleNamespace(num_chunks_in_sw=num_chunks_in_sw),
+        get_subchunk_sw_size_tokens=lambda kg: 256,
     )
     cache_context = MagicMock()
     cache_context.kv_layer_groups_manager = kvlgm
     cache_context.calculate_num_blocks.return_value = 1  # 1 block per chunk
+    cache_context.lmcache_tokens_per_chunk = 256
     cache_context.max_batch_size = 8
 
     event_backend = MagicMock()
@@ -125,6 +128,7 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw):
     ]
     ctx = MagicMock()
     ctx.chunk_size = 256
+    ctx.retrieve_window_chunks = 2
     ctx.resolve_obj_keys.return_value = obj_keys
 
     read_calls: list[list[str]] = []
@@ -137,7 +141,7 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw):
     ctx.storage_manager.read_prefetched_results = MagicMock(side_effect=fake_read)
     module._ctx = ctx
 
-    transfer_calls: list[tuple[int, list]] = []
+    transfer_calls: list[tuple[int, list, list, int]] = []
 
     def fake_transfer(
         cache_context,
@@ -148,22 +152,29 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw):
         skip_first_n_tokens,
         direction,
     ):
-        transfer_calls.append((object_group_id, list(memory_objs)))
+        transfer_calls.append(
+            (object_group_id, list(memory_objs), list(block_ids), skip_first_n_tokens)
+        )
+
+    stream_releases: list[list[str]] = []
+
+    def fake_stream_release(stream, kind, keys):
+        stream_releases.append((kind, list(keys)))
 
     monkeypatch.setattr(mod, "transfer_kv_per_object_group", fake_transfer)
-    monkeypatch.setattr(mod, "downsample_and_stage_block_ids", lambda cc, b: b)
-    monkeypatch.setattr(mod, "submit_callback_to_stream", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "downsample_and_stage_block_ids", lambda cc, b, num_chunks=0: b)
+    monkeypatch.setattr(mod, "submit_callback_to_stream", fake_stream_release)
     monkeypatch.setattr(mod, "torch_dev", MagicMock())
     monkeypatch.setattr(mod, "Event", MagicMock())
 
-    return module, read_calls, transfer_calls
+    return module, read_calls, transfer_calls, stream_releases
 
 
 def test_retrieve_reads_and_transfers_only_in_window(monkeypatch):
     # Group 0 = full attention (-1): whole prefix; group 1 = mamba window 1:
-    # only the last chunk.
+    # only the last chunk. retrieve_window_chunks=2 (set in _make_module).
     num_chunks = 5
-    module, read_calls, transfer_calls = _make_module(
+    module, read_calls, transfer_calls, stream_releases = _make_module(
         monkeypatch, num_chunks, num_chunks_in_sw=[-1, 1]
     )
     # 1 block per chunk -> block-id lists of length num_chunks (avoid underflow).
@@ -177,23 +188,43 @@ def test_retrieve_reads_and_transfers_only_in_window(monkeypatch):
     )
     assert ok is True
 
-    # Full-attention group reads all 5 keys; mamba group reads only the last.
-    assert read_calls[0] == [f"g0c{c}" for c in range(5)]
-    assert read_calls[1] == ["g1c4"]
+    # Reads stream in windows of 2 chunks per group; the mamba group reads
+    # only its in-window tail.
+    assert read_calls == [
+        ["g0c0", "g0c1"],
+        ["g0c2", "g0c3"],
+        ["g0c4"],
+        ["g1c4"],
+    ]
 
-    # memory_objs handed to the transfer stay full-length; the mamba group's
-    # skipped prefix is None-padded (skip = num_chunks - window = 4).
-    grp0, mem0 = transfer_calls[0]
-    grp1, mem1 = transfer_calls[1]
-    assert grp0 == 0 and len(mem0) == 5 and all(o is not None for o in mem0)
-    assert grp1 == 1 and len(mem1) == 5
-    assert [o is None for o in mem1] == [True, True, True, True, False]
+    # memory_objs are window-local (no None padding); block ids are sliced
+    # to the same chunk window (1 block per chunk here).
+    # block ids arrive per kernel group; each object group here maps 1:1.
+    assert [(g, blocks[g]) for g, _mem, blocks, _skip in transfer_calls] == [
+        (0, [1, 2]),
+        (0, [3, 4]),
+        (0, [5]),
+        (1, [9]),
+    ]
+    assert all(
+        all(o is not None for o in mem) for _g, mem, _b, _s in transfer_calls
+    )
+
+    # Each window's L1 read locks are released in stream order right after
+    # its copy is enqueued.
+    assert stream_releases == [
+        ("finish_read_prefetched", ["g0c0", "g0c1"]),
+        ("finish_read_prefetched", ["g0c2", "g0c3"]),
+        ("finish_read_prefetched", ["g0c4"]),
+        ("finish_read_prefetched", ["g1c4"]),
+    ]
 
 
 def test_retrieve_full_attention_only_reads_everything(monkeypatch):
-    # No sliding-window group: behavior is unchanged (read all, no None-pad).
+    # Single full-attention group: every chunk is read and transferred,
+    # streamed in windows.
     num_chunks = 3
-    module, read_calls, transfer_calls = _make_module(
+    module, read_calls, transfer_calls, stream_releases = _make_module(
         monkeypatch, num_chunks, num_chunks_in_sw=[-1]
     )
     _handle, ok = module.retrieve(
@@ -203,6 +234,50 @@ def test_retrieve_full_attention_only_reads_everything(monkeypatch):
         event_ipc_handle=b"x",
     )
     assert ok is True
-    assert read_calls == [["g0c0", "g0c1", "g0c2"]]
-    _grp, mem = transfer_calls[0]
-    assert len(mem) == 3 and all(o is not None for o in mem)
+    assert read_calls == [["g0c0", "g0c1"], ["g0c2"]]
+    for _g, mem, _b, _s in transfer_calls:
+        assert all(o is not None for o in mem)
+    assert [blocks[0] for _g, _m, blocks, _s in transfer_calls] == [[1, 2], [3]]
+    assert stream_releases == [
+        ("finish_read_prefetched", ["g0c0", "g0c1"]),
+        ("finish_read_prefetched", ["g0c2"]),
+    ]
+
+
+def test_retrieve_window_skip_tokens_shift_per_window(monkeypatch):
+    # skip_first_n_tokens shifts into window-local coordinates: only the
+    # first windows keep a nonzero skip.
+    num_chunks = 5
+    module, _read_calls, transfer_calls, _releases = _make_module(
+        monkeypatch, num_chunks, num_chunks_in_sw=[-1]
+    )
+    _handle, ok = module.retrieve(
+        key=SimpleNamespace(request_id="req", cache_salt="salt"),
+        instance_id=1,
+        gpu_block_ids=[[1, 2, 3, 4, 5]],
+        event_ipc_handle=b"x",
+        skip_first_n_tokens=300,
+    )
+    assert ok is True
+    skips = [skip for _g, _m, _b, skip in transfer_calls]
+    assert skips == [300, 0, 0]
+
+
+def test_slice_block_ids_for_window_contiguous():
+    cache_context = MagicMock()
+    cache_context.kv_layer_groups_manager = SimpleNamespace(
+        num_kernel_groups=2,
+        get_subchunk_sw_size_tokens=lambda kg: 256 if kg == 0 else 128,
+    )
+    cache_context.lmcache_tokens_per_chunk = 256
+    # keep = 1 block/chunk for kg0 (min(256,256)=256), 2 for kg1 (min(256,128)=128)
+    cache_context.calculate_num_blocks = MagicMock(
+        side_effect=lambda tokens, kg: 1 if tokens == 256 else 2
+    )
+    staged = [list(range(10)), list(range(20))]
+
+    sliced = mod._slice_block_ids_for_window(
+        cache_context, staged, start_chunk=2, num_chunks=3
+    )
+    assert sliced[0] == [2, 3, 4]
+    assert sliced[1] == [4, 5, 6, 7, 8, 9]

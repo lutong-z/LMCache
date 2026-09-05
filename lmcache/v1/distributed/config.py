@@ -259,6 +259,16 @@ class StorageManagerConfig:
     prefetch_max_in_flight: int = 8
     """ Maximum number of concurrent prefetch requests. """
 
+    prefetch_l1_reserve_batch_keys: int = 32
+    """ Maximum keys reserved in one L1 write-buffer batch during L2
+    prefetch. Bounds each atomic allocation so a large restore degrades to
+    a prefix window instead of failing all-or-nothing. """
+
+    retrieve_window_chunks: int = 16
+    """ Maximum chunks read-locked and transferred per window during an
+    L2 retrieve. Bounds the L1 read occupancy of a large restore so it
+    streams through L1 instead of requiring the whole prefix at once. """
+
     periodic_notifier_interval_ms: int = 5
     """ Interval (ms) for the periodic event notifier heartbeat. """
 
@@ -529,6 +539,23 @@ def add_storage_manager_args(
         help="Maximum number of concurrent prefetch requests. Default is 8.",
     )
     policy_group.add_argument(
+        "--l2-retrieve-window-chunks",
+        type=int,
+        default=16,
+        help="Maximum chunks read-locked and transferred per window during "
+        "an L2 retrieve. Bounds the L1 read occupancy of a large restore so "
+        "it streams through L1 instead of requiring the whole prefix at "
+        "once. Default is 16.",
+    )
+    policy_group.add_argument(
+        "--l2-prefetch-l1-reserve-batch-keys",
+        type=int,
+        default=32,
+        help="Maximum keys per L1 write-buffer reservation batch during L2 "
+        "prefetch. Bounds each atomic allocation so a large restore degrades "
+        "to a prefix window instead of failing all-or-nothing. Default is 32.",
+    )
+    policy_group.add_argument(
         "--periodic-notifier-interval-ms",
         type=int,
         default=5,
@@ -623,6 +650,8 @@ def parse_args_to_config(
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
+        prefetch_l1_reserve_batch_keys=args.l2_prefetch_l1_reserve_batch_keys,
+        retrieve_window_chunks=args.l2_retrieve_window_chunks,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
     )
     return config

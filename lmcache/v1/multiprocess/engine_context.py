@@ -219,6 +219,7 @@ class MPCacheServerContext:
             storage_manager_config
         )
         self._storage_manager = StorageManager(storage_manager_config)
+        self._retrieve_window_chunks = storage_manager_config.retrieve_window_chunks
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
         )
@@ -235,6 +236,11 @@ class MPCacheServerContext:
         self._storage_manager.close()
         # Tear down the GDS cuFile context (the shared slab + its handle).
         get_gds_context().close()
+
+    @property
+    def retrieve_window_chunks(self) -> int:
+        """Maximum chunks read-locked and transferred per retrieve window."""
+        return self._retrieve_window_chunks
 
     @property
     def chunk_size(self) -> int:
