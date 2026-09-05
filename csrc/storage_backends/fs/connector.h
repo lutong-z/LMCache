@@ -26,6 +26,7 @@ struct WorkerFSConn {
   std::filesystem::path base_path;
   std::filesystem::path tmp_dir;  // empty if not configured
   bool use_odirect = false;
+  bool refresh_access_time = false;
   size_t disk_block_size = 0;
   // If > 0, trigger filesystem readahead by issuing a small
   // initial read of this many bytes before reading the rest.
@@ -36,7 +37,7 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
  public:
   FSConnector(std::string base_path, int num_workers,
               std::string relative_tmp_dir = "", bool use_odirect = false,
-              size_t read_ahead_size = 0);
+              size_t read_ahead_size = 0, bool refresh_access_time = false);
   ~FSConnector() override;
 
  protected:
@@ -74,6 +75,7 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   bool use_odirect_;
   size_t disk_block_size_;
   size_t read_ahead_size_;
+  bool refresh_access_time_;
 };
 
 }  // namespace connector

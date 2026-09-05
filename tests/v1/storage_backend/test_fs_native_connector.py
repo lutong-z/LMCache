@@ -82,6 +82,47 @@ def _submit_and_wait(
     return _wait_for_completion(client, future_id)
 
 
+@pytest.mark.parametrize("refresh_access_time", [False, True])
+def test_exists_optionally_refreshes_access_time(
+    tmp_path, refresh_access_time: bool
+) -> None:
+    """Successful lookups refresh mtime only when explicitly enabled."""
+    LMCacheFSClient = _import_fs_client()
+    key = "test_model@00000000@0@0123456789abcdef"
+    source = memoryview(bytearray(4096))
+    _fill(source)
+    client = LMCacheFSClient(
+        str(tmp_path),
+        1,
+        "",
+        False,
+        0,
+        refresh_access_time,
+    )
+    try:
+        store = _submit_and_wait(client, "submit_batch_set", key, source)
+        assert store[1], store[2]
+        files = list(tmp_path.glob("*.data"))
+        assert len(files) == 1
+        file_path = files[0]
+        old_ns = 1_000_000_000
+        os.utime(file_path, ns=(old_ns, old_ns))
+        stored_mtime_ns = file_path.stat().st_mtime_ns
+
+        future_id = client.submit_batch_exists([key])
+        lookup = _wait_for_completion(client, future_id)
+        assert lookup[1], lookup[2]
+        assert lookup[3] == [True]
+
+        refreshed_mtime_ns = file_path.stat().st_mtime_ns
+        if refresh_access_time:
+            assert refreshed_mtime_ns > stored_mtime_ns
+        else:
+            assert refreshed_mtime_ns == stored_mtime_ns
+    finally:
+        client.close()
+
+
 def test_odirect_read_does_not_split_for_read_ahead(tmp_path) -> None:
     """O_DIRECT reads should ignore read_ahead_size and use one aligned read."""
     if not hasattr(os, "O_DIRECT"):

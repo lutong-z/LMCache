@@ -148,13 +148,14 @@ static bool try_enable_odirect(int& flags, const void* buf, size_t len,
 
 FSConnector::FSConnector(std::string base_path, int num_workers,
                          std::string relative_tmp_dir, bool use_odirect,
-                         size_t read_ahead_size)
+                         size_t read_ahead_size, bool refresh_access_time)
     : ConnectorBase(num_workers),
       base_path_(std::move(base_path)),
       relative_tmp_dir_(std::move(relative_tmp_dir)),
       use_odirect_(use_odirect),
       disk_block_size_(0),
-      read_ahead_size_(read_ahead_size) {
+      read_ahead_size_(read_ahead_size),
+      refresh_access_time_(refresh_access_time) {
   // Create base directory
   std::filesystem::create_directories(base_path_);
 
@@ -184,6 +185,7 @@ WorkerFSConn FSConnector::create_connection() {
     conn.tmp_dir = std::filesystem::path(base_path_) / relative_tmp_dir_;
   }
   conn.use_odirect = use_odirect_;
+  conn.refresh_access_time = refresh_access_time_;
   conn.disk_block_size = disk_block_size_;
   conn.read_ahead_size = read_ahead_size_;
   return conn;
@@ -292,7 +294,16 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
 bool FSConnector::do_single_exists(WorkerFSConn& conn, const std::string& key) {
   std::string filename = key_to_filename(key);
   auto file_path = conn.base_path / filename;
-  return std::filesystem::exists(file_path);
+  std::error_code ec;
+  if (!std::filesystem::exists(file_path, ec) || ec) {
+    return false;
+  }
+  if (!conn.refresh_access_time) {
+    return true;
+  }
+  std::filesystem::last_write_time(
+      file_path, std::filesystem::file_time_type::clock::now(), ec);
+  return !ec;
 }
 
 bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {

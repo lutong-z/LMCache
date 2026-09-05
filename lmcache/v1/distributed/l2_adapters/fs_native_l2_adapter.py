@@ -45,6 +45,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     - use_odirect: bypass page cache via O_DIRECT.
     - read_ahead_size: trigger filesystem readahead by
       reading this many bytes first (optional).
+    - refresh_access_time: refresh object mtime on successful lookup so an
+      external lifecycle process can apply idle TTL and LRU (default false).
     """
 
     def __init__(
@@ -55,6 +57,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        refresh_access_time: bool = False,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
@@ -62,6 +65,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
         self.max_capacity_gb = max_capacity_gb
+        self.refresh_access_time = refresh_access_time
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
@@ -86,6 +90,10 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             if not isinstance(read_ahead_size, int) or read_ahead_size <= 0:
                 raise ValueError("read_ahead_size must be a positive integer")
 
+        refresh_access_time = d.get("refresh_access_time", False)
+        if not isinstance(refresh_access_time, bool):
+            raise ValueError("refresh_access_time must be a boolean")
+
         max_capacity_gb = d.get("max_capacity_gb", 0)
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
@@ -97,6 +105,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=use_odirect,
             read_ahead_size=read_ahead_size,
             max_capacity_gb=float(max_capacity_gb),
+            refresh_access_time=refresh_access_time,
         )
 
     @classmethod
@@ -116,7 +125,9 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "first (optional)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)"
+            "(default 0 = disabled)\n"
+            "- refresh_access_time (bool): refresh object mtime on "
+            "successful lookup (default false)"
         )
 
 
@@ -150,13 +161,16 @@ def _create_fs_native_l2_adapter(
         config.relative_tmp_dir,
         config.use_odirect,
         config.read_ahead_size or 0,
+        config.refresh_access_time,
     )
     logger.info(
-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
+        "Created FS native L2 adapter: %s "
+        "(workers=%d, odirect=%s, read_ahead=%s, refresh_access_time=%s)",
         config.base_path,
         config.num_workers,
         config.use_odirect,
         config.read_ahead_size,
+        config.refresh_access_time,
     )
     return NativeConnectorL2Adapter(
         native_client,
@@ -167,6 +181,7 @@ def _create_fs_native_l2_adapter(
             "use_odirect": config.use_odirect,
             "num_workers": config.num_workers,
             "read_ahead_size": config.read_ahead_size,
+            "refresh_access_time": config.refresh_access_time,
         },
     )
 

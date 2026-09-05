@@ -969,6 +969,7 @@ class TestFSNativeL2AdapterConfig:
         assert config.relative_tmp_dir == ""
         assert config.use_odirect is False
         assert config.read_ahead_size is None
+        assert config.refresh_access_time is False
 
     def test_from_dict_full(self):
         # First Party
@@ -984,6 +985,7 @@ class TestFSNativeL2AdapterConfig:
                 "relative_tmp_dir": ".tmp",
                 "use_odirect": True,
                 "read_ahead_size": 4096,
+                "refresh_access_time": True,
             }
         )
         assert config.base_path == "/data/kv_cache"
@@ -991,6 +993,7 @@ class TestFSNativeL2AdapterConfig:
         assert config.relative_tmp_dir == ".tmp"
         assert config.use_odirect is True
         assert config.read_ahead_size == 4096
+        assert config.refresh_access_time is True
 
     def test_from_dict_missing_base_path_raises(self):
         # First Party
@@ -1072,6 +1075,21 @@ class TestFSNativeL2AdapterConfig:
                 }
             )
 
+    def test_from_dict_invalid_refresh_access_time_raises(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="refresh_access_time"):
+            FSNativeL2AdapterConfig.from_dict(
+                {
+                    "type": "fs_native",
+                    "base_path": "/tmp/x",
+                    "refresh_access_time": "yes",
+                }
+            )
+
     def test_from_dict_invalid_read_ahead_size_raises(
         self,
     ):
@@ -1126,6 +1144,7 @@ class TestFSNativeL2AdapterConfig:
         assert "num_workers" in h
         assert "use_odirect" in h
         assert "read_ahead_size" in h
+        assert "refresh_access_time" in h
 
     def test_type_name_lookup(self):
         # First Party
