@@ -826,6 +826,21 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             cache_salt=tracker.cache_salt,
         )
 
+    def reset_load_state(self, request: "Request") -> bool:
+        """Drop per-request lookup/retrieve bookkeeping so the scheduler can
+        retry a failed external KV load with a fresh LOOKUP + RETRIEVE cycle.
+
+        The scheduler frees the request's blocks right after this call, so a
+        brand-new tracker (created lazily on the next admission) is both
+        correct and required: staged hit counters and block bookkeeping must
+        not leak into the retry.
+        """
+        if self.role != KVConnectorRole.SCHEDULER:
+            return False
+        self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+        self.request_trackers.pop(request.request_id, None)
+        return True
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

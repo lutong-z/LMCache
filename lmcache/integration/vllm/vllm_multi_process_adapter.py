@@ -57,6 +57,11 @@ class ExtraConfigDefault(enum.Enum):
     # Interval (seconds) between periodic heartbeat pings
     # to the server.
     heartbeat_interval = 10.0
+    # Timeout (seconds) for a single heartbeat PING. Kept separate from
+    # the interval: a short ping cadence must not declare the server
+    # unhealthy just because a slow restore or transfer is occupying the
+    # server's control plane.
+    heartbeat_timeout = 10.0
     # Routing mode for ``create_transfer_context``: ``auto`` keeps the
     # historical CUDA -> lmcache_driven / others -> engine_driven dispatch;
     # ``lmcache_driven`` forces the IPC / SHM zero-copy path where the
@@ -71,6 +76,7 @@ class ExtraConfigDefault(enum.Enum):
 # entry point, which still passes these as positional/keyword args.
 DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.value
 DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.value
+DEFAULT_HEARTBEAT_TIMEOUT: float = ExtraConfigDefault.heartbeat_timeout.value
 
 _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
 
@@ -254,9 +260,13 @@ def send_ping(
         future = send_lmcache_request(mq_client, RequestType.PING, [instance_id])
         return future.result(timeout=timeout)
     except TimeoutError:
+        logger.warning(
+            "LMCache PING timed out after %.1fs; marking server unhealthy.",
+            timeout,
+        )
         return False
     except Exception:
-        logger.debug("Ping failed with exception", exc_info=True)
+        logger.warning("LMCache PING failed with exception", exc_info=True)
         return False
 
 
@@ -379,6 +389,7 @@ class HeartbeatThread(PeriodicThread):
         health_event: threading.Event,
         interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         instance_id: int | None = None,
+        timeout: float | None = None,
     ):
         """
         Args:
@@ -387,10 +398,12 @@ class HeartbeatThread(PeriodicThread):
                 Set when the server is healthy, cleared when unhealthy.
                 Adapters check this event to decide whether to proceed
                 with operations or enter degraded mode.
-            interval: Seconds between heartbeat pings and ping timeout.
+            interval: Seconds between heartbeat pings.
             instance_id: The worker's instance ID sent with each PING so the
                 server can refresh its liveness, or None for an untracked
                 prober (the scheduler adapter).
+            timeout: Seconds to wait for each PING response. Defaults to
+                ``interval`` for backward compatibility.
         """
         super().__init__(
             name="lmcache-heartbeat",
@@ -400,6 +413,7 @@ class HeartbeatThread(PeriodicThread):
         self._mq_client = mq_client
         self._health_event = health_event
         self._interval = interval
+        self._timeout = interval if timeout is None else timeout
         self._instance_id = instance_id
 
         # Optional callback invoked on the unhealthy->healthy edge,
@@ -440,7 +454,7 @@ class HeartbeatThread(PeriodicThread):
         """
         was_healthy = self._health_event.is_set()
         healthy = send_ping(
-            self._mq_client, timeout=self._interval, instance_id=self._instance_id
+            self._mq_client, timeout=self._timeout, instance_id=self._instance_id
         )
 
         if self.stop_requested:
@@ -538,6 +552,7 @@ class LMCacheMPSchedulerAdapter:
         *,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT,
         extra_config: dict[str, Any] | None = None,
     ):
         """
@@ -575,6 +590,7 @@ class LMCacheMPSchedulerAdapter:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
+            heartbeat_timeout = cfg[ExtraConfigDefault.heartbeat_timeout.name]
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -631,6 +647,7 @@ class LMCacheMPSchedulerAdapter:
         # It will be lazily started on the first lookup
         # request, by which time vLLM is fully ready.
         self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
         self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
 
@@ -666,6 +683,7 @@ class LMCacheMPSchedulerAdapter:
                     mq_client=client,
                     health_event=self._health_events[url],
                     interval=self._heartbeat_interval,
+                    timeout=self._heartbeat_timeout,
                 )
                 hb.start()
                 self._heartbeats[url] = hb
@@ -1042,6 +1060,7 @@ class LMCacheMPWorkerAdapter:
         *,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT,
         extra_config: dict[str, Any] | None = None,
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
@@ -1077,6 +1096,7 @@ class LMCacheMPWorkerAdapter:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
+            heartbeat_timeout = cfg[ExtraConfigDefault.heartbeat_timeout.name]
             # Only treat ``mp_transfer_mode`` as an explicit override when
             # the user actually set it in extra_config; otherwise leave it
             # as ``None`` so ``create_transfer_context`` can still consult
@@ -1169,6 +1189,7 @@ class LMCacheMPWorkerAdapter:
         # request, by which time vLLM is fully ready (model loaded,
         # KV caches allocated, warmup & CUDA graph capture done).
         self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
         self._heartbeat: HeartbeatThread | None = None
         self._heartbeat_lock = threading.Lock()
         if 3 * heartbeat_interval > _SERVER_REAP_TIMEOUT_FLOOR_SECONDS:
@@ -1334,6 +1355,7 @@ class LMCacheMPWorkerAdapter:
                 health_event=self._health_event,
                 interval=self._heartbeat_interval,
                 instance_id=self.instance_id,
+                timeout=self._heartbeat_timeout,
             )
             heartbeat.register_recover_callback(self._reregister_kv_caches_callback)
             heartbeat.start()
@@ -1652,7 +1674,7 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, _) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
 
@@ -1660,6 +1682,11 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
+                # A failed retrieve MUST surface its blocks as invalid:
+                # reporting the request as finished without them would resume
+                # generation on the unwritten GPU range (garbage KV, i.e.
+                # content corruption).
+                self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -1772,7 +1799,7 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, _) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
 
@@ -1780,6 +1807,11 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
+                # A failed retrieve MUST surface its blocks as invalid:
+                # reporting the request as finished without them would resume
+                # generation on the unwritten GPU range (garbage KV, i.e.
+                # content corruption).
+                self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",

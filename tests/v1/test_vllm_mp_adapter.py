@@ -48,6 +48,7 @@ class FakeHeartbeatThread:
         health_event: threading.Event | None = None,
         interval: float = 0.0,
         instance_id: int | None = None,
+        timeout: float | None = None,
     ) -> None:
         self.mq_client = mq_client
         self.health_event = (
@@ -55,6 +56,7 @@ class FakeHeartbeatThread:
         )
         self.interval = interval
         self.instance_id = instance_id
+        self.timeout = timeout
         # Snapshot of the health event at construction time: lets tests
         # assert the adapter starts the heartbeat healthy (event still set).
         self.health_event_set_at_init = self.health_event.is_set()
@@ -798,3 +800,134 @@ def test_recovery_reports_the_ring_re_registration_result(fake_adapter, ring_ok)
     adapter.register_kv_caches({"layer.0": fake_tensor})
 
     assert adapter._reregister_kv_caches_callback() is ring_ok
+
+
+def test_heartbeat_timeout_defaults_to_interval(monkeypatch) -> None:
+    """Without an explicit timeout, PING keeps the historical behavior of
+    using the heartbeat interval as its timeout."""
+    captured = {}
+
+    def fake_send_ping(mq_client, timeout, instance_id=None):
+        captured["timeout"] = timeout
+        return True
+
+    monkeypatch.setattr(adapter_mod, "send_ping", fake_send_ping)
+    heartbeat = adapter_mod.HeartbeatThread(
+        mq_client=MagicMock(),
+        health_event=threading.Event(),
+        interval=3.0,
+    )
+    heartbeat._execute()
+    assert captured["timeout"] == 3.0
+
+
+def test_heartbeat_timeout_independent_of_interval(monkeypatch) -> None:
+    """A short ping cadence must not shrink the PING timeout: a slow
+    restore occupying the server control plane is not a health failure."""
+    captured = {}
+
+    def fake_send_ping(mq_client, timeout, instance_id=None):
+        captured["timeout"] = timeout
+        return True
+
+    monkeypatch.setattr(adapter_mod, "send_ping", fake_send_ping)
+    heartbeat = adapter_mod.HeartbeatThread(
+        mq_client=MagicMock(),
+        health_event=threading.Event(),
+        interval=1.0,
+        timeout=10.0,
+    )
+    heartbeat._execute()
+    assert captured["timeout"] == 10.0
+
+
+def test_send_ping_logs_timeout_reason(monkeypatch, caplog) -> None:
+    """A heartbeat timeout must say so in the logs; silent health flips
+    made a previous incident undiagnosable."""
+
+    class TimeoutFuture:
+        def result(self, timeout):
+            raise TimeoutError()
+
+    monkeypatch.setattr(
+        adapter_mod, "send_lmcache_request", lambda *a, **k: TimeoutFuture()
+    )
+    with caplog.at_level("WARNING"):
+        assert adapter_mod.send_ping(MagicMock(), timeout=10.0) is False
+    assert "timed out after 10.0s" in caplog.text
+
+
+def test_reset_load_state_clears_tracker_and_lookup() -> None:
+    """A scheduler-role connector must drop every staged lookup/retrieve
+    counter so a retried load starts from a clean LOOKUP."""
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+    from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+
+    connector = object.__new__(LMCacheMPConnector)
+    connector._role = KVConnectorRole.SCHEDULER
+    tracker = object()
+    connector.request_trackers = {"req-1": tracker}
+    connector.scheduler_adapter = MagicMock()
+
+    request = MagicMock()
+    request.request_id = "req-1"
+    assert connector.reset_load_state(request) is True
+    connector.scheduler_adapter.cleanup_lookup_result.assert_called_once_with(
+        "req-1"
+    )
+    assert connector.request_trackers == {}
+
+
+def test_reset_load_state_rejects_non_scheduler_role() -> None:
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+    from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+
+    connector = object.__new__(LMCacheMPConnector)
+    connector._role = KVConnectorRole.WORKER
+    assert connector.reset_load_state(MagicMock()) is False
+
+
+def _failed_retrieve_future():
+    future = MagicMock()
+    future.query.return_value = True
+    future.result.return_value = False
+    return future
+
+
+def test_failed_retrieve_reports_blocks_as_load_errors(fake_adapter):
+    """A healthy-path retrieve that returns False must surface its blocks
+    as load errors; otherwise the request resumes on garbage KV."""
+    adapter, _send_mock, _ = fake_adapter
+    adapter._health_event.set()
+    adapter.retrieve_futures["req-1"] = (_failed_retrieve_future(), [11, 12, 13])
+
+    _stores, retrieves = adapter.get_finished(set())
+
+    assert retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {11, 12, 13}
+
+
+def test_failed_retrieve_reports_blocks_in_lazy_offload(fake_adapter):
+    adapter, _send_mock, _ = fake_adapter
+    adapter.lazy_offload = True
+    adapter._health_event.set()
+    adapter.retrieve_futures["req-1"] = (_failed_retrieve_future(), [21, 22])
+
+    _stores, retrieves = adapter.get_finished_with_lazy_offload()
+
+    assert retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {21, 22}
+
+
+def test_successful_retrieve_reports_no_load_errors(fake_adapter):
+    adapter, _send_mock, _ = fake_adapter
+    adapter._health_event.set()
+    ok_future = MagicMock()
+    ok_future.query.return_value = True
+    ok_future.result.return_value = True
+    adapter.retrieve_futures["req-1"] = (ok_future, [31])
+
+    _stores, retrieves = adapter.get_finished(set())
+
+    assert retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == set()
