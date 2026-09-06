@@ -1545,12 +1545,27 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+        ed = time.perf_counter()
         if retrieve_succeeded:
             tokens_retrieved = num_chunks * self._ctx.chunk_size
-            ed = time.perf_counter()
             logger.info(
-                "Retrieved %d tokens in %.3f seconds",
+                "Retrieved %d tokens for request_id=%s in %.3f seconds",
                 tokens_retrieved,
+                key.request_id,
+                ed - st,
+            )
+        else:
+            # Failure must be request-addressable: bind the request id and
+            # the expected/actual transfer counts so a partial or missing
+            # restore can be traced without cross-correlating timestamps.
+            logger.error(
+                "Retrieve FAILED for request_id=%s: transferred %d/%d keys "
+                "(%d/%d tokens) in %.3f seconds",
+                key.request_id,
+                len(prefetched_keys),
+                expected_retained,
+                len(prefetched_keys) * self._ctx.chunk_size,
+                expected_retained * self._ctx.chunk_size,
                 ed - st,
             )
 
